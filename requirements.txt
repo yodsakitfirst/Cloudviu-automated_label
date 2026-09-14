@@ -1,0 +1,6 @@
+ultralytics==8.4.149
+numpy>=2.0,<3
+pandas>=2.2,<3
+PyYAML>=6.0,<7
+opencv-python>=4.10,<5
+pytest>=8,<9

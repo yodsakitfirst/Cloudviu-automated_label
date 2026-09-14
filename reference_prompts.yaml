@@ -1,0 +1,3 @@
+# Populate only from verified product references. Omitting bbox means the
+# source image is already a tight product crop.
+references: []
