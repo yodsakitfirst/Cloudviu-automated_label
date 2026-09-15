@@ -1,5 +1,10 @@
+import csv
+import io
+import zipfile
 from pathlib import Path
 
+import cv2
+import numpy as np
 import pytest
 from openpyxl import Workbook
 
@@ -15,6 +20,52 @@ def write_workbook(path: Path, rows: list[tuple[object, object]]) -> None:
     for barcode, name in rows:
         sheet.append([barcode, name])
     workbook.save(path)
+
+
+def write_image(path: Path) -> None:
+    image = np.zeros((4, 5, 3), dtype=np.uint8)
+    assert cv2.imwrite(str(path), image)
+
+
+@pytest.fixture
+def package_fixture(tmp_path):
+    workbook = tmp_path / "sku.xlsx"
+    write_workbook(
+        workbook,
+        [("8851932487177", "สินค้า หนึ่ง"), ("8851932487178", "สินค้า สอง")],
+    )
+    products = tmp_path / "products"
+    products.mkdir()
+    write_image(products / "สินค้า หนึ่ง.png")
+    write_image(products / "สินค้า สอง.jpg")
+    shelves = tmp_path / "shelves"
+    shelves.mkdir()
+    write_image(shelves / "a.jpg")
+    write_image(shelves / "b.JPG")
+    (shelves / "index.csv").write_text("ignored", encoding="utf-8")
+    overrides = tmp_path / "overrides.yaml"
+    overrides.write_text("overrides: {}\n", encoding="utf-8")
+    repo_root = tmp_path / "repo"
+    (repo_root / "tests").mkdir(parents=True)
+    (repo_root / "colab").mkdir()
+    (repo_root / "yoloe_autolabel.py").write_bytes(b"engine-bytes")
+    (repo_root / "requirements.txt").write_text("dependency==1\n", encoding="utf-8")
+    (repo_root / "tests" / "test_yoloe_autolabel.py").write_text(
+        "def test_packaged_engine(): pass\n", encoding="utf-8"
+    )
+    (repo_root / "colab" / "config.yaml").write_text("project: {}\n", encoding="utf-8")
+    (repo_root / "colab" / "hair_colab_enterprise.ipynb").write_text(
+        '{"cells": []}\n', encoding="utf-8"
+    )
+    return prep.PackageInputs(
+        workbook=workbook,
+        product_images=products,
+        shelf_images=shelves,
+        repo_root=repo_root,
+        overrides=overrides,
+        expected_skus=2,
+        expected_shelves=2,
+    )
 
 
 def test_load_sheet2_skus_preserves_row_order_barcodes_and_thai_names(tmp_path):
@@ -127,3 +178,97 @@ def test_load_reference_overrides_requires_a_string_mapping(tmp_path):
     invalid.write_text("overrides:\n  A: 2\n", encoding="utf-8")
     with pytest.raises(ValueError, match="string product names"):
         prep.load_reference_overrides(invalid)
+
+
+def test_discover_shelf_images_selects_only_unique_decodable_jpg_files(tmp_path):
+    shelves = tmp_path / "shelves"
+    shelves.mkdir()
+    write_image(shelves / "a.jpg")
+    write_image(shelves / "b.JPG")
+    (shelves / "index.csv").write_text("ignored", encoding="utf-8")
+
+    assert [
+        path.name for path in prep.discover_shelf_images(shelves, expected_count=2)
+    ] == ["a.jpg", "b.JPG"]
+
+
+def test_build_runtime_package_copies_bytes_and_uses_ascii_archive_paths(
+    package_fixture, tmp_path
+):
+    destination = tmp_path / "hair_colab_runtime.zip"
+
+    report = prep.build_runtime_package(package_fixture, destination)
+
+    assert report == prep.PackageReport(destination.resolve(), 2, 2, 2)
+    with zipfile.ZipFile(destination) as archive:
+        names = archive.namelist()
+        assert all(name.isascii() for name in names)
+        assert archive.read("hair_colab/yoloe_autolabel.py") == b"engine-bytes"
+        assert (
+            archive.read("hair_colab/references/class_000_8851932487177.png")
+            == (package_fixture.product_images / "สินค้า หนึ่ง.png").read_bytes()
+        )
+        manifest = list(
+            csv.DictReader(
+                io.StringIO(
+                    archive.read("hair_colab/sku_manifest.csv").decode("utf-8")
+                )
+            )
+        )
+        assert manifest == [
+            {
+                "class_id": "0",
+                "barcode": "8851932487177",
+                "brand": "Unspecified",
+                "sku_name": "สินค้า หนึ่ง",
+                "enabled": "true",
+            },
+            {
+                "class_id": "1",
+                "barcode": "8851932487178",
+                "brand": "Unspecified",
+                "sku_name": "สินค้า สอง",
+                "enabled": "true",
+            },
+        ]
+
+
+def test_build_runtime_package_refuses_to_replace_an_archive(package_fixture, tmp_path):
+    destination = tmp_path / "hair_colab_runtime.zip"
+    destination.write_bytes(b"sentinel")
+
+    with pytest.raises(FileExistsError):
+        prep.build_runtime_package(package_fixture, destination)
+
+    assert destination.read_bytes() == b"sentinel"
+
+
+def test_discover_shelf_images_rejects_corrupt_duplicate_and_non_ascii_inputs(tmp_path):
+    corrupt = tmp_path / "corrupt"
+    corrupt.mkdir()
+    (corrupt / "a.jpg").write_bytes(b"not-an-image")
+    with pytest.raises(ValueError, match="cannot be decoded"):
+        prep.discover_shelf_images(corrupt, expected_count=1)
+
+    duplicate = tmp_path / "duplicate"
+    duplicate.mkdir()
+    write_image(duplicate / "A.jpg")
+    write_image(duplicate / "a.jpeg")
+    with pytest.raises(ValueError, match="Duplicate shelf image stem"):
+        prep.discover_shelf_images(duplicate, expected_count=2)
+
+    non_ascii = tmp_path / "non-ascii"
+    non_ascii.mkdir()
+    write_image(non_ascii / "ชั้น.jpg")
+    with pytest.raises(ValueError, match="not ASCII"):
+        prep.discover_shelf_images(non_ascii, expected_count=1)
+
+
+def test_failed_package_build_leaves_no_final_archive(package_fixture, tmp_path):
+    destination = tmp_path / "hair_colab_runtime.zip"
+    (package_fixture.repo_root / "colab" / "config.yaml").unlink()
+
+    with pytest.raises(ValueError, match="Required package input is missing"):
+        prep.build_runtime_package(package_fixture, destination)
+
+    assert not destination.exists()

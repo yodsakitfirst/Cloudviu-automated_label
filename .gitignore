@@ -6,3 +6,5 @@ __pycache__/
 output/raw_predictions/
 output/full_v1/raw_predictions/
 .superpowers/sdd/
+/dist/
+/colab/generated/
