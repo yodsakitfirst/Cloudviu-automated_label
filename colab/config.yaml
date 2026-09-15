@@ -1,0 +1,31 @@
+project:
+  name: hair_osa_89
+
+dataset:
+  sku_manifest: sku_manifest.csv
+  references: reference_prompts.yaml
+  shelf_images: shelf_images
+  image_extensions: [".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"]
+
+yoloe:
+  model: yoloe-26l-seg.pt
+  imgsz: 1280
+  conf: 0.10
+  iou: 0.50
+  device: 0
+  prompt_batch_size: 8
+  canvas_cell_size: 512
+  canvas_padding: 16
+
+output:
+  root: output
+  overwrite: false
+  save_metadata: true
+  save_previews: true
+  low_confidence_cutoff: 0.20
+
+pilot:
+  enabled: false
+  class_ids: []
+  max_skus: 5
+  max_images: 10

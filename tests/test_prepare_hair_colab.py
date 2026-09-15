@@ -50,6 +50,9 @@ def package_fixture(tmp_path):
     (repo_root / "colab").mkdir()
     (repo_root / "yoloe_autolabel.py").write_bytes(b"engine-bytes")
     (repo_root / "requirements.txt").write_text("dependency==1\n", encoding="utf-8")
+    (repo_root / "colab_runtime.py").write_text(
+        "def package_results(): pass\n", encoding="utf-8"
+    )
     (repo_root / "tests" / "test_yoloe_autolabel.py").write_text(
         "def test_packaged_engine(): pass\n", encoding="utf-8"
     )
@@ -204,6 +207,7 @@ def test_build_runtime_package_copies_bytes_and_uses_ascii_archive_paths(
         names = archive.namelist()
         assert all(name.isascii() for name in names)
         assert archive.read("hair_colab/yoloe_autolabel.py") == b"engine-bytes"
+        assert archive.read("hair_colab/colab_runtime.py") == b"def package_results(): pass\n"
         assert (
             archive.read("hair_colab/references/class_000_8851932487177.png")
             == (package_fixture.product_images / "สินค้า หนึ่ง.png").read_bytes()

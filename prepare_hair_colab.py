@@ -287,6 +287,7 @@ def _copy_verified(source: Path, destination: Path) -> None:
 def _required_repo_files(repo_root: Path) -> dict[Path, Path]:
     return {
         repo_root / "yoloe_autolabel.py": Path("yoloe_autolabel.py"),
+        repo_root / "colab_runtime.py": Path("colab_runtime.py"),
         repo_root / "requirements.txt": Path("requirements.txt"),
         repo_root / "tests" / "test_yoloe_autolabel.py": Path("tests/test_yoloe_autolabel.py"),
         repo_root / "colab" / "config.yaml": Path("config.yaml"),
