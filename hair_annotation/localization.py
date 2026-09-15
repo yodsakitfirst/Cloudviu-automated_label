@@ -3,12 +3,22 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
+from typing import Any
 
 import numpy as np
 
 from .config import LocalizationConfig
 from .types import Candidate, Tile
+
+
+_GEOMETRY_REJECTION_KEYS = (
+    "non_finite",
+    "zero_area",
+    "too_small",
+    "too_large",
+    "aspect_ratio",
+)
 
 
 def _axis_starts(length: int, tile_size: int, overlap: float) -> list[int]:
@@ -182,3 +192,247 @@ def class_agnostic_nms(
             continue
         kept.append(candidate)
     return kept, duplicate_count
+
+
+def load_text_localizer(model_name: str, prompts: Sequence[str]) -> Any:
+    """Load a YOLOE segmentation checkpoint and configure text prompts."""
+    try:
+        from ultralytics import YOLOE
+
+        model = YOLOE(model_name)
+        model.set_classes(list(prompts))
+        return model
+    except Exception as exc:
+        raise RuntimeError(
+            f"Unable to load YOLOE text localizer '{model_name}': {exc}. "
+            "Make the offline checkpoint available locally before running."
+        ) from exc
+
+
+def _as_numpy(value: Any) -> np.ndarray:
+    current = value
+    for method_name in ("detach", "cpu"):
+        method = getattr(current, method_name, None)
+        if callable(method):
+            current = method()
+    numpy_method = getattr(current, "numpy", None)
+    if callable(numpy_method):
+        current = numpy_method()
+    return np.asarray(current)
+
+
+def _parse_tile_result(
+    results: Any,
+    tile: Tile,
+    prompts: Sequence[str],
+) -> tuple[list[Candidate], int, int]:
+    if not results:
+        raise ValueError("YOLOE returned no result object")
+    result = results[0]
+    boxes = getattr(result, "boxes", None)
+    if boxes is None:
+        raise ValueError("YOLOE result is missing boxes")
+
+    xyxy = _as_numpy(boxes.xyxy)
+    confidence = _as_numpy(boxes.conf).reshape(-1)
+    prompt_indices = _as_numpy(boxes.cls).reshape(-1)
+    if xyxy.size == 0:
+        xyxy = xyxy.reshape((0, 4))
+    if xyxy.ndim != 2 or xyxy.shape[1] != 4:
+        raise ValueError("boxes.xyxy must have shape (N, 4)")
+    if not (len(xyxy) == len(confidence) == len(prompt_indices)):
+        raise ValueError("YOLOE output arrays have unequal lengths")
+
+    mask_polygons = getattr(getattr(result, "masks", None), "xy", None)
+    candidates: list[Candidate] = []
+    mask_count = 0
+    fallback_count = 0
+    for index, (box, score, raw_prompt_index) in enumerate(
+        zip(xyxy, confidence, prompt_indices)
+    ):
+        try:
+            prompt_value = float(raw_prompt_index)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"YOLOE returned invalid prompt index {raw_prompt_index!r}"
+            ) from exc
+        if not math.isfinite(prompt_value) or prompt_value != math.floor(prompt_value):
+            raise ValueError(f"YOLOE returned invalid prompt index {prompt_value!r}")
+        prompt_index = int(prompt_value)
+        if not 0 <= prompt_index < len(prompts):
+            raise ValueError(f"YOLOE returned unknown prompt index {prompt_index}")
+
+        mask_box = None
+        if mask_polygons is not None:
+            try:
+                mask_box = mask_to_box(mask_polygons[index])
+            except (IndexError, TypeError, ValueError):
+                mask_box = None
+        if mask_box is None:
+            selected_box = tuple(float(value) for value in box)
+            mask_used = False
+            fallback_count += 1
+        else:
+            selected_box = mask_box
+            mask_used = True
+            mask_count += 1
+
+        x1, y1, x2, y2 = selected_box
+        candidates.append(
+            Candidate(
+                xyxy=(x1 + tile.x, y1 + tile.y, x2 + tile.x, y2 + tile.y),
+                localization_confidence=float(score),
+                prompt_name=prompts[prompt_index],
+                tile_index=tile.index,
+                mask_used=mask_used,
+            )
+        )
+    return candidates, mask_count, fallback_count
+
+
+def _infer_tile(
+    model: Any,
+    image_bgr: np.ndarray,
+    tile: Tile,
+    config: LocalizationConfig,
+    imgsz: int,
+    device: int | str,
+) -> tuple[list[Candidate], int, int]:
+    tile_image = image_bgr[
+        tile.y : tile.y + tile.height,
+        tile.x : tile.x + tile.width,
+    ]
+    try:
+        results = model.predict(
+            source=tile_image,
+            imgsz=imgsz,
+            conf=config.conf,
+            iou=config.iou,
+            device=device,
+            verbose=False,
+        )
+        return _parse_tile_result(results, tile, config.prompts)
+    except Exception as exc:
+        raise RuntimeError(
+            f"YOLOE text localization failed for tile {tile.index}: {exc}"
+        ) from exc
+
+
+def _diagnostics(
+    tile_count: int,
+    raw_count: int,
+    mask_count: int,
+    fallback_count: int,
+    duplicate_count: int,
+    rejected: dict[str, int],
+) -> dict[str, int]:
+    diagnostics = {
+        "tiles": tile_count,
+        "raw_candidates": raw_count,
+        "mask_boxes": mask_count,
+        "fallback_boxes": fallback_count,
+        "duplicates_removed": duplicate_count,
+    }
+    diagnostics.update(
+        {reason: rejected.get(reason, 0) for reason in _GEOMETRY_REJECTION_KEYS}
+    )
+    return diagnostics
+
+
+def localize_image(
+    model: Any,
+    image_bgr: np.ndarray,
+    config: LocalizationConfig,
+    imgsz: int,
+    device: int | str,
+) -> tuple[list[Candidate], dict[str, int]]:
+    """Run text-prompted YOLOE inference over tiled shelf imagery."""
+    image_height, image_width = image_bgr.shape[:2]
+    tiles = generate_tiles(image_width, image_height, config.tile_size, config.overlap)
+    raw_candidates: list[Candidate] = []
+    mask_count = 0
+    fallback_count = 0
+    for tile in tiles:
+        tile_candidates, tile_masks, tile_fallbacks = _infer_tile(
+            model, image_bgr, tile, config, imgsz, device
+        )
+        raw_candidates.extend(tile_candidates)
+        mask_count += tile_masks
+        fallback_count += tile_fallbacks
+
+    filtered, rejected = filter_candidates(
+        raw_candidates, image_width, image_height, config
+    )
+    kept, duplicate_count = class_agnostic_nms(filtered, config.nms_iou)
+    return kept, _diagnostics(
+        len(tiles),
+        len(raw_candidates),
+        mask_count,
+        fallback_count,
+        duplicate_count,
+        rejected,
+    )
+
+
+def _filter_reference_candidates(
+    candidates: Iterable[Candidate], image_width: int, image_height: int
+) -> tuple[list[Candidate], dict[str, int]]:
+    valid: list[Candidate] = []
+    rejected: dict[str, int] = {}
+    for candidate in candidates:
+        values = (*candidate.xyxy, candidate.localization_confidence)
+        try:
+            finite = all(math.isfinite(float(value)) for value in values)
+        except (TypeError, ValueError):
+            finite = False
+        if not finite:
+            _record_rejection(rejected, "non_finite")
+            continue
+
+        x1, y1, x2, y2 = (float(value) for value in candidate.xyxy)
+        clipped = (
+            min(max(x1, 0.0), float(image_width)),
+            min(max(y1, 0.0), float(image_height)),
+            min(max(x2, 0.0), float(image_width)),
+            min(max(y2, 0.0), float(image_height)),
+        )
+        if clipped[2] <= clipped[0] or clipped[3] <= clipped[1]:
+            _record_rejection(rejected, "zero_area")
+            continue
+        valid.append(
+            Candidate(
+                xyxy=clipped,
+                localization_confidence=candidate.localization_confidence,
+                prompt_name=candidate.prompt_name,
+                tile_index=candidate.tile_index,
+                mask_used=candidate.mask_used,
+            )
+        )
+    return valid, rejected
+
+
+def localize_reference_image(
+    model: Any,
+    image_bgr: np.ndarray,
+    config: LocalizationConfig,
+    imgsz: int,
+    device: int | str,
+) -> tuple[list[Candidate], dict[str, int]]:
+    """Localize products in one full reference image without shelf heuristics."""
+    image_height, image_width = image_bgr.shape[:2]
+    tile = Tile(index=0, x=0, y=0, width=image_width, height=image_height)
+    raw_candidates, mask_count, fallback_count = _infer_tile(
+        model, image_bgr, tile, config, imgsz, device
+    )
+    filtered, rejected = _filter_reference_candidates(
+        raw_candidates, image_width, image_height
+    )
+    kept, duplicate_count = class_agnostic_nms(filtered, config.nms_iou)
+    return kept, _diagnostics(
+        1,
+        len(raw_candidates),
+        mask_count,
+        fallback_count,
+        duplicate_count,
+        rejected,
+    )
