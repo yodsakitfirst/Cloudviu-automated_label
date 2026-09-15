@@ -9,7 +9,7 @@ The prepared files are:
 - `colab/hair_colab_enterprise.ipynb` — import this notebook into Colab Enterprise;
 - `dist/hair_colab_runtime.zip` — upload this archive through the notebook Files pane.
 
-All paths inside the ZIP are ASCII-safe. Product names remain in Thai inside `sku_manifest.csv` so labels retain the exact business names. Product reference files use names such as `class_000_8851932487177.jpg`.
+All paths inside the ZIP are ASCII-safe. `sku_manifest.csv` uses concise English class names in `sku_name` and retains the original Thai names in `sku_name_th`. Preview boxes therefore use readable English text. Product reference files use names such as `class_000_8851932487177.jpg`.
 
 ## Runtime steps
 

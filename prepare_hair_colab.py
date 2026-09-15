@@ -34,6 +34,7 @@ class PackageInputs:
     shelf_images: Path
     repo_root: Path
     overrides: Path
+    translations: Path
     expected_skus: int = 89
     expected_shelves: int = 632
 
@@ -145,6 +146,51 @@ def load_reference_overrides(path: Path) -> dict[str, str]:
     ):
         raise ValueError("Reference overrides must map string product names to string filenames")
     return {product_name.strip(): filename.strip() for product_name, filename in overrides.items()}
+
+
+def load_sku_translations(path: Path, skus: Sequence[HairSku]) -> dict[str, str]:
+    """Load one English ASCII class name for every source barcode."""
+    try:
+        import yaml
+    except ImportError as exc:
+        raise RuntimeError("PyYAML is required to read SKU translations") from exc
+
+    translation_path = Path(path).resolve()
+    try:
+        payload = yaml.safe_load(translation_path.read_text(encoding="utf-8"))
+    except (OSError, yaml.YAMLError) as exc:
+        raise ValueError(f"Cannot read SKU translations {translation_path}: {exc}") from exc
+    if not isinstance(payload, dict) or not isinstance(payload.get("translations"), dict):
+        raise ValueError("SKU translations must contain a 'translations' mapping")
+
+    raw_translations = payload["translations"]
+    if any(
+        not isinstance(barcode, str)
+        or not barcode.strip()
+        or not isinstance(name, str)
+        or not name.strip()
+        for barcode, name in raw_translations.items()
+    ):
+        raise ValueError("SKU translations must map string barcodes to English names")
+    translations = {
+        barcode.strip(): " ".join(name.split())
+        for barcode, name in raw_translations.items()
+    }
+    non_ascii = sorted(barcode for barcode, name in translations.items() if not name.isascii())
+    if non_ascii:
+        raise ValueError(f"SKU translation names must be ASCII; invalid barcodes: {non_ascii}")
+
+    expected = {sku.barcode for sku in skus}
+    received = set(translations)
+    missing = sorted(expected - received)
+    extra = sorted(received - expected)
+    if missing:
+        raise ValueError(f"SKU translations have missing barcodes: {missing}")
+    if extra:
+        raise ValueError(f"SKU translations have unexpected barcodes: {extra}")
+    if len(set(translations.values())) != len(translations):
+        raise ValueError("SKU translation names must be unique")
+    return translations
 
 
 def match_product_references(
@@ -299,12 +345,20 @@ def _write_registry_files(
     package_root: Path,
     skus: Sequence[HairSku],
     matched_references: Mapping[int, Path],
+    translations: Mapping[str, str],
 ) -> None:
     manifest_path = package_root / "sku_manifest.csv"
     with manifest_path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(
             handle,
-            fieldnames=("class_id", "barcode", "brand", "sku_name", "enabled"),
+            fieldnames=(
+                "class_id",
+                "barcode",
+                "brand",
+                "sku_name",
+                "sku_name_th",
+                "enabled",
+            ),
         )
         writer.writeheader()
         for sku in skus:
@@ -313,7 +367,8 @@ def _write_registry_files(
                     "class_id": sku.class_id,
                     "barcode": sku.barcode,
                     "brand": "Unspecified",
-                    "sku_name": sku.sku_name,
+                    "sku_name": translations[sku.barcode],
+                    "sku_name_th": sku.sku_name,
                     "enabled": "true",
                 }
             )
@@ -416,6 +471,7 @@ def build_runtime_package(
 
     skus = load_sheet2_skus(inputs.workbook, inputs.expected_skus)
     overrides = load_reference_overrides(inputs.overrides)
+    translations = load_sku_translations(inputs.translations, skus)
     references = match_product_references(skus, inputs.product_images, overrides)
     for source in references.values():
         _validate_decodable_image(source, "Product reference")
@@ -429,7 +485,7 @@ def build_runtime_package(
         package_root.mkdir()
         for source, relative_destination in required_files.items():
             _copy_verified(source, package_root / relative_destination)
-        _write_registry_files(package_root, skus, references)
+        _write_registry_files(package_root, skus, references, translations)
         for sku in skus:
             source = references[sku.class_id]
             _copy_verified(
@@ -464,6 +520,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--shelf-images", required=True)
     parser.add_argument("--repo-root", default=str(Path(__file__).resolve().parent))
     parser.add_argument("--overrides", default="colab/reference_name_overrides.yaml")
+    parser.add_argument("--translations", default="colab/sku_name_translations.yaml")
     parser.add_argument("--output", default="dist/hair_colab_runtime.zip")
     parser.add_argument("--metadata-output")
     parser.add_argument("--expected-skus", type=_positive_argument, default=89)
@@ -482,6 +539,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 shelf_images=Path(args.shelf_images),
                 repo_root=Path(args.repo_root),
                 overrides=Path(args.overrides),
+                translations=Path(args.translations),
                 expected_skus=args.expected_skus,
                 expected_shelves=args.expected_shelves,
             ),

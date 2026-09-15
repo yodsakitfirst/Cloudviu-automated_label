@@ -53,6 +53,7 @@ Rebuild the upload archive from the supplied source data with:
   --workbook "/Users/me/Downloads/Cloudviu-data/HAIR SKU list (with Account list).xlsx" \
   --product-images "/Users/me/Downloads/Cloudviu-data/HAIR_product_images" \
   --shelf-images "/Users/me/Downloads/Cloudviu-data/HAIR_shelf_images" \
+  --translations colab/sku_name_translations.yaml \
   --metadata-output colab/generated \
   --output dist/hair_colab_runtime.zip
 ```
@@ -74,11 +75,11 @@ shelf_images/
 The manifest is the permanent class registry:
 
 ```csv
-class_id,barcode,brand,sku_name,enabled
-0,0012345678905,Example Brand,Example Shampoo 370ml,true
+class_id,barcode,brand,sku_name,sku_name_th,enabled
+0,0012345678905,Example Brand,Example Shampoo 370 ml,แชมพูตัวอย่าง 370 มล,true
 ```
 
-`class_id` is a unique non-negative YOLO training ID. `barcode` is the stable business ID and is always read as text so leading zeros survive. Brand and name must be non-empty; `enabled` accepts only `true` or `false` (case-insensitive). Duplicate IDs or barcodes are fatal.
+`class_id` is a unique non-negative YOLO training ID. `barcode` is the stable business ID and is always read as text so leading zeros survive. `sku_name` is the ASCII English class name used in previews; `sku_name_th` retains the source Thai name for traceability. Brand and `sku_name` must be non-empty; `enabled` accepts only `true` or `false` (case-insensitive). Duplicate IDs or barcodes are fatal.
 
 Reference definitions allow multiple views of one SKU:
 

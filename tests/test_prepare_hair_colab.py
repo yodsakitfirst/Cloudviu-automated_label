@@ -45,6 +45,13 @@ def package_fixture(tmp_path):
     (shelves / "index.csv").write_text("ignored", encoding="utf-8")
     overrides = tmp_path / "overrides.yaml"
     overrides.write_text("overrides: {}\n", encoding="utf-8")
+    translations = tmp_path / "translations.yaml"
+    translations.write_text(
+        "translations:\n"
+        "  '8851932487177': Product One\n"
+        "  '8851932487178': Product Two\n",
+        encoding="utf-8",
+    )
     repo_root = tmp_path / "repo"
     (repo_root / "tests").mkdir(parents=True)
     (repo_root / "colab").mkdir()
@@ -66,6 +73,7 @@ def package_fixture(tmp_path):
         shelf_images=shelves,
         repo_root=repo_root,
         overrides=overrides,
+        translations=translations,
         expected_skus=2,
         expected_shelves=2,
     )
@@ -183,6 +191,42 @@ def test_load_reference_overrides_requires_a_string_mapping(tmp_path):
         prep.load_reference_overrides(invalid)
 
 
+def test_load_sku_translations_requires_an_exact_ascii_barcode_map(tmp_path):
+    skus = [
+        prep.HairSku(0, "8851932487177", "สินค้า หนึ่ง"),
+        prep.HairSku(1, "8851932487178", "สินค้า สอง"),
+    ]
+    valid = tmp_path / "valid.yaml"
+    valid.write_text(
+        "translations:\n"
+        "  '8851932487177': Product One\n"
+        "  '8851932487178': Product Two\n",
+        encoding="utf-8",
+    )
+    assert prep.load_sku_translations(valid, skus) == {
+        "8851932487177": "Product One",
+        "8851932487178": "Product Two",
+    }
+
+    missing = tmp_path / "missing.yaml"
+    missing.write_text(
+        "translations:\n  '8851932487177': Product One\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="missing barcodes"):
+        prep.load_sku_translations(missing, skus)
+
+    thai = tmp_path / "thai.yaml"
+    thai.write_text(
+        "translations:\n"
+        "  '8851932487177': สินค้า One\n"
+        "  '8851932487178': Product Two\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="ASCII"):
+        prep.load_sku_translations(thai, skus)
+
+
 def test_discover_shelf_images_selects_only_unique_decodable_jpg_files(tmp_path):
     shelves = tmp_path / "shelves"
     shelves.mkdir()
@@ -224,14 +268,16 @@ def test_build_runtime_package_copies_bytes_and_uses_ascii_archive_paths(
                 "class_id": "0",
                 "barcode": "8851932487177",
                 "brand": "Unspecified",
-                "sku_name": "สินค้า หนึ่ง",
+                "sku_name": "Product One",
+                "sku_name_th": "สินค้า หนึ่ง",
                 "enabled": "true",
             },
             {
                 "class_id": "1",
                 "barcode": "8851932487178",
                 "brand": "Unspecified",
-                "sku_name": "สินค้า สอง",
+                "sku_name": "Product Two",
+                "sku_name_th": "สินค้า สอง",
                 "enabled": "true",
             },
         ]
@@ -294,6 +340,8 @@ def test_cli_metadata_output_contains_only_registry_files(package_fixture, tmp_p
             str(package_fixture.repo_root),
             "--overrides",
             str(package_fixture.overrides),
+            "--translations",
+            str(package_fixture.translations),
             "--output",
             str(destination),
             "--metadata-output",
