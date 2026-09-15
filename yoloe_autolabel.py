@@ -24,6 +24,8 @@ from typing import Any, Mapping, Sequence
 
 import numpy as np
 
+from hair_annotation.config import BoxFirstConfig
+
 
 @dataclass(frozen=True)
 class Sku:
@@ -62,7 +64,16 @@ class PromptBatch:
     temporary_class_ids: np.ndarray
 
 
-_REQUIRED_SECTIONS = ("project", "dataset", "yoloe", "output", "pilot")
+_REQUIRED_SECTIONS = (
+    "project",
+    "dataset",
+    "yoloe",
+    "localization",
+    "matching",
+    "export",
+    "output",
+    "pilot",
+)
 _MANIFEST_COLUMNS = ("class_id", "barcode", "brand", "sku_name", "enabled")
 _OFFICIAL_YOLOE_ALIASES = frozenset(
     f"yoloe-{family}{size}-seg.pt"
@@ -109,6 +120,7 @@ def _validate_config(data: dict[str, Any]) -> None:
     for section in _REQUIRED_SECTIONS:
         if not isinstance(data.get(section), dict):
             raise ValueError(f"Config section '{section}' must be a mapping")
+    BoxFirstConfig.from_mapping(data)
     dataset = data["dataset"]
     yoloe = data["yoloe"]
     output = data["output"]
@@ -120,25 +132,31 @@ def _validate_config(data: dict[str, Any]) -> None:
     extensions = dataset.get("extensions", dataset.get("image_extensions"))
     if not isinstance(extensions, (list, tuple)) or not extensions or any(not isinstance(ext, str) or not ext.strip() for ext in extensions):
         raise ValueError("dataset image extensions must be a non-empty list of strings")
-    model = yoloe.get("model", yoloe.get("model_path"))
+    model = yoloe.get("model")
     if not isinstance(model, str) or not model.strip():
         raise ValueError("yoloe.model must be a non-empty string")
-    for key in ("imgsz", "prompt_batch_size", "canvas_cell_size"):
-        if key not in yoloe:
-            raise ValueError(f"Missing required config value yoloe.{key}")
-        _positive_integer(yoloe[key], f"yoloe.{key}")
+    if "imgsz" not in yoloe:
+        raise ValueError("Missing required config value yoloe.imgsz")
+    _positive_integer(yoloe["imgsz"], "yoloe.imgsz")
+    # Legacy visual-prompt controls are no longer required, but validate them
+    # when present so older configs cannot silently carry malformed values.
+    for key in ("prompt_batch_size", "canvas_cell_size"):
+        if key in yoloe:
+            _positive_integer(yoloe[key], f"yoloe.{key}")
     for key in ("conf", "iou"):
-        if key not in yoloe:
-            raise ValueError(f"Missing required config value yoloe.{key}")
-        _probability(yoloe[key], f"yoloe.{key}")
+        if key in yoloe:
+            _probability(yoloe[key], f"yoloe.{key}")
     device = yoloe.get("device")
     if isinstance(device, bool) or not (
         (type(device) is int and device >= 0) or (isinstance(device, str) and bool(device.strip()))
     ):
         raise ValueError("yoloe.device must be a non-negative integer or non-empty string")
-    padding = yoloe.get("canvas_padding")
-    if type(padding) is not int or padding < 0 or padding * 2 >= yoloe["canvas_cell_size"]:
-        raise ValueError("yoloe.canvas_padding must be a non-negative integer smaller than half the cell size")
+    if "canvas_padding" in yoloe:
+        padding = yoloe["canvas_padding"]
+        if type(padding) is not int or padding < 0:
+            raise ValueError("yoloe.canvas_padding must be a non-negative integer")
+        if "canvas_cell_size" in yoloe and padding * 2 >= yoloe["canvas_cell_size"]:
+            raise ValueError("yoloe.canvas_padding must be smaller than half the cell size")
     root = output.get("root")
     # The effective root can be supplied by --output; when present in the file,
     # it must still be valid at this configuration-only boundary.

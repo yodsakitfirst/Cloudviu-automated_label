@@ -51,6 +51,30 @@ def valid_config(**overrides):
         "project": {},
         "dataset": {"manifest": "sku.csv", "references": "refs.yaml", "images": "images", "image_extensions": ["jpg"]},
         "yoloe": {"model": "yoloe-26l-seg.pt", "imgsz": 640, "conf": .25, "iou": .7, "device": "cpu", "prompt_batch_size": 1, "canvas_cell_size": 32, "canvas_padding": 2},
+        "localization": {
+            "tile_size": 1024,
+            "overlap": 0.20,
+            "prompts": ["shampoo bottle", "conditioner bottle", "hair treatment pouch", "boxed hair product", "hair care multipack"],
+            "conf": 0.10,
+            "iou": 0.50,
+            "min_side": 12,
+            "max_area_ratio": 0.10,
+            "min_aspect_ratio": 0.15,
+            "max_aspect_ratio": 4.0,
+            "nms_iou": 0.50,
+        },
+        "matching": {
+            "model": "ViT-B-32",
+            "pretrained": "laion2b_s34b_b79k",
+            "visual_weight": 0.80,
+            "text_weight": 0.20,
+            "min_score": 0.24,
+            "min_margin": 0.02,
+            "max_reference_views": 3,
+            "needs_review_class_id": 89,
+            "text_template": "a retail hair-care product package of {english_sku_name}",
+        },
+        "export": {"train_fraction": 0.90, "split_seed": "hair-osa-v1"},
         "output": {"root": "output", "overwrite": False, "save_metadata": True, "save_previews": True, "low_confidence_cutoff": .2},
         "pilot": {"enabled": False, "class_ids": [], "max_images": 1, "max_skus": 1},
     }
@@ -504,13 +528,7 @@ class CliTests(unittest.TestCase):
             app.parse_args(["--config", "c.yaml", "--require-enabled-count", "0"])
 
     def test_validate_only_never_loads_model_or_creates_output(self):
-        config = {
-            "project": {},
-            "dataset": {"manifest": "sku.csv", "references": "refs.yaml", "images": "images", "image_extensions": ["jpg"]},
-            "yoloe": {"model": "model.pt", "imgsz": 640, "conf": .25, "iou": .7, "device": "cpu", "prompt_batch_size": 1, "canvas_cell_size": 32, "canvas_padding": 2},
-            "output": {"root": "output", "overwrite": False, "save_metadata": True, "save_previews": True},
-            "pilot": {"enabled": False, "max_images": 1, "max_skus": 1},
-        }
+        config = valid_config(yoloe={"model": "model.pt"})
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             config_path = root / "config.yaml"

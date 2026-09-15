@@ -10,12 +10,39 @@ dataset:
 yoloe:
   model: yoloe-26l-seg.pt
   imgsz: 1280
+  device: 0
+
+localization:
+  tile_size: 1024
+  overlap: 0.20
+  prompts:
+    - shampoo bottle
+    - conditioner bottle
+    - hair treatment pouch
+    - boxed hair product
+    - hair care multipack
   conf: 0.10
   iou: 0.50
-  device: 0
-  prompt_batch_size: 8
-  canvas_cell_size: 512
-  canvas_padding: 16
+  min_side: 12
+  max_area_ratio: 0.10
+  min_aspect_ratio: 0.15
+  max_aspect_ratio: 4.0
+  nms_iou: 0.50
+
+matching:
+  model: ViT-B-32
+  pretrained: laion2b_s34b_b79k
+  visual_weight: 0.80
+  text_weight: 0.20
+  min_score: 0.24
+  min_margin: 0.02
+  max_reference_views: 3
+  needs_review_class_id: 89
+  text_template: "a retail hair-care product package of {english_sku_name}"
+
+export:
+  train_fraction: 0.90
+  split_seed: hair-osa-v1
 
 output:
   root: output
