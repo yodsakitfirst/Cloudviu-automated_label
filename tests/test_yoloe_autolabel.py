@@ -19,11 +19,11 @@ class FakeCv2:
     LINE_AA = 0
 
     def __init__(self, images=None):
-        self.images = {str(Path(k)): v for k, v in (images or {}).items()}
+        self.images = {str(Path(k).resolve()): v for k, v in (images or {}).items()}
         self.writes = {}
 
     def imread(self, path):
-        image = self.images.get(str(Path(path)))
+        image = self.images.get(str(Path(path).resolve()))
         return None if image is None else image.copy()
 
     def imwrite(self, path, image):
