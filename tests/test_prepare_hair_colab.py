@@ -24,7 +24,18 @@ def write_workbook(path: Path, rows: list[tuple[object, object]]) -> None:
 
 def write_image(path: Path) -> None:
     image = np.zeros((4, 5, 3), dtype=np.uint8)
-    assert cv2.imwrite(str(path), image)
+    success, encoded = cv2.imencode(path.suffix, image)
+    assert success
+    path.write_bytes(encoded.tobytes())
+
+
+def test_source_decoder_supports_native_thai_path(tmp_path):
+    path = tmp_path / "สินค้า หนึ่ง.png"
+    write_image(path)
+    assert [entry.name for entry in tmp_path.iterdir()] == ["สินค้า หนึ่ง.png"]
+    before = path.read_bytes()
+    prep._validate_decodable_image(path, "Product reference")
+    assert path.read_bytes() == before
 
 
 @pytest.fixture
@@ -251,7 +262,7 @@ def test_build_runtime_package_copies_bytes_and_uses_ascii_archive_paths(
         names = archive.namelist()
         assert all(name.isascii() for name in names)
         assert archive.read("hair_colab/yoloe_autolabel.py") == b"engine-bytes"
-        assert archive.read("hair_colab/colab_runtime.py") == b"def package_results(): pass\n"
+        assert archive.read("hair_colab/colab_runtime.py") == (package_fixture.repo_root / "colab_runtime.py").read_bytes()
         assert (
             archive.read("hair_colab/references/class_000_8851932487177.png")
             == (package_fixture.product_images / "สินค้า หนึ่ง.png").read_bytes()

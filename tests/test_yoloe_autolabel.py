@@ -11,6 +11,7 @@ from pathlib import Path
 from unittest import mock
 
 import numpy as np
+import pytest
 
 import yoloe_autolabel as app
 from hair_annotation.types import Candidate, ClassifiedCandidate, RankedSku
@@ -878,6 +879,50 @@ def test_cli_runs_localization_then_matching_for_all_enabled_skus(tmp_path):
     assert not (raw / "prompt_canvases").exists()
 
 
+def test_box_first_pilot_keeps_all_enabled_sku_identities(tmp_path):
+    root, config_path = write_box_first_project(tmp_path)
+    config = json.loads(config_path.read_text())
+    config["pilot"].update(enabled=True, max_skus=1, class_ids=[0])
+    config_path.write_text(json.dumps(config))
+    with box_first_environment(root):
+        assert app.main(["--config", str(config_path)]) == 0
+    raw = root / "output/raw_predictions"
+    assert (raw / "labels/shelf_0.txt").read_text().startswith("1 ")
+    provenance = json.loads((raw / "provenance.json").read_text())
+    assert provenance["active_class_ids"] == [0, 1]
+    assert [sku["barcode"] for sku in provenance["active_skus"]] == ["111", "112"]
+
+
+def test_explicit_reference_roi_excludes_full_image_detection(tmp_path):
+    path = tmp_path / "reference.jpg"
+    path.write_bytes(b"immutable reference")
+    image = np.full((80, 60, 3), 10, np.uint8)
+    image[55:75, 35:55] = 20
+    before = image.copy()
+    received = []
+
+    class RecordingBackend(ColorEmbeddingBackend):
+        def encode_images(self, images):
+            received.extend(view.copy() for view in images)
+            return super().encode_images(images)
+
+    class FullImageDetection:
+        def predict(self, **kwargs):
+            boxes = types.SimpleNamespace(xyxy=np.array([[10, 10, 30, 50]]), conf=np.array([.8]), cls=np.array([0]))
+            return [types.SimpleNamespace(boxes=boxes, masks=None)]
+
+    sku = app.Sku(0, "111", "Brand", "Dove Blue", True, "Thai")
+    config = app.BoxFirstConfig.from_mapping(valid_config())
+    with mock.patch.object(app, "OpenClipBackend", RecordingBackend):
+        _, _, diagnostics = app.build_runtime_matcher([sku], [app.ReferencePrompt(0, path, (35, 55, 55, 75))], {path: image}, FullImageDetection(), config.localization, config.matching, 640, "cpu")
+    assert len(received) == 1
+    assert received[0].shape == (20, 20, 3)
+    assert np.all(received[0] == 20)
+    assert diagnostics[0]["source_roi_xyxy"] == [35, 55, 55, 75]
+    np.testing.assert_array_equal(image, before)
+    assert path.read_bytes() == b"immutable reference"
+
+
 def test_uncertain_preview_and_review_queue_use_english_suggestion(tmp_path):
     root, config_path = write_box_first_project(tmp_path)
     with box_first_environment(root, shelf_color=30) as (cv2, _):
@@ -913,6 +958,34 @@ def test_box_first_resume_preserves_queue_and_aggregate_metadata(tmp_path):
     with (raw / "review_queue.csv").open() as handle:
         rows = list(csv.DictReader(handle))
     assert len(rows) == 1 and rows[0]["assigned_class_id"] == "89"
+
+
+@pytest.mark.parametrize("corruption", ["header_only", "truncated", "duplicate", "altered"])
+def test_resume_rejects_queue_inconsistent_with_retained_metadata(tmp_path, corruption):
+    root, config_path = write_box_first_project(tmp_path, image_count=2)
+    with box_first_environment(root):
+        assert app.main(["--config", str(config_path)]) == 0
+    raw = root / "output/raw_predictions"
+    queue = raw / "review_queue.csv"
+    with queue.open(newline="") as handle:
+        reader = csv.DictReader(handle)
+        columns, rows = reader.fieldnames, list(reader)
+    if corruption == "header_only":
+        rows = []
+    elif corruption == "truncated":
+        rows = rows[:1]
+    elif corruption == "duplicate":
+        rows.append(rows[0].copy())
+    else:
+        rows[0]["assigned_barcode"] = "corrupted"
+    with queue.open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=columns, lineterminator="\n")
+        writer.writeheader()
+        writer.writerows(rows)
+    before = {str(path): path.read_bytes() for path in raw.rglob("*") if path.is_file()}
+    with box_first_environment(root):
+        assert app.main(["--config", str(config_path)]) == 2
+    assert {str(path): path.read_bytes() for path in raw.rglob("*") if path.is_file()} == before
 
 
 def test_no_candidates_is_review_status_with_null_score_statistics(tmp_path):
@@ -958,10 +1031,12 @@ def test_geometry_rejections_and_duplicates_are_reported(tmp_path):
     metadata = json.loads((raw / "metadata/shelf_0.json").read_text())
     assert metadata["geometry_rejections"]["too_small"] == 1
     assert metadata["geometry_rejections"]["too_large"] == 1
+    assert metadata["geometry_rejections"] == {"non_finite": 0, "zero_area": 0, "too_small": 1, "too_large": 1, "aspect_ratio": 0}
     assert metadata["duplicates_removed"] == 1
     run = json.loads((raw / "run.json").read_text())
     assert run["totals"]["geometry_rejections"]["too_small"] == 1
     assert run["totals"]["geometry_rejections"]["too_large"] == 1
+    assert run["totals"]["geometry_rejections"] == metadata["geometry_rejections"]
 
 
 def test_runtime_weight_changes_refuse_resume_before_output_changes(tmp_path):
@@ -973,8 +1048,46 @@ def test_runtime_weight_changes_refuse_resume_before_output_changes(tmp_path):
     with box_first_environment(root), mock.patch.object(app, "OpenClipBackend", WeightedBackend):
         assert app.main(["--config", str(config_path)]) == 0
         raw = root / "output/raw_predictions"
+        assert app.main(["--config", str(config_path)]) == 0
         before = {str(path): path.read_bytes() for path in raw.rglob("*") if path.is_file()}
         WeightedBackend.weight = 2.
+        assert app.main(["--config", str(config_path)]) == 2
+        assert {str(path): path.read_bytes() for path in raw.rglob("*") if path.is_file()} == before
+
+
+@pytest.mark.parametrize("dtype_name", ["float32", "float64", "bfloat16"])
+def test_runtime_weight_fingerprint_preserves_real_tensors_and_is_order_independent(dtype_name):
+    torch = pytest.importorskip("torch")
+    weight = torch.tensor([[1., 2.]], dtype=getattr(torch, dtype_name), requires_grad=True)
+    bias = torch.tensor([3.], dtype=getattr(torch, dtype_name))
+    before = weight.detach().clone()
+    model = types.SimpleNamespace(state_dict=lambda: {"weight": weight, "bias": bias})
+    reversed_model = types.SimpleNamespace(state_dict=lambda: {"bias": bias, "weight": weight})
+    fingerprint = app._runtime_weight_fingerprint(model)
+    assert fingerprint == app._runtime_weight_fingerprint(reversed_model)
+    assert fingerprint != app._runtime_weight_fingerprint(types.SimpleNamespace(state_dict=lambda: {"weight": weight.reshape(2, 1), "bias": bias}))
+    assert fingerprint != app._runtime_weight_fingerprint(types.SimpleNamespace(state_dict=lambda: {"renamed": weight, "bias": bias}))
+    assert torch.equal(weight.detach(), before)
+    assert weight.requires_grad and weight.grad is None
+
+
+def test_yoloe_runtime_weight_changes_refuse_resume_before_output_changes(tmp_path):
+    root, config_path = write_box_first_project(tmp_path)
+
+    class WeightedLocalizer:
+        weight = 1.
+        def __init__(self):
+            self.model = types.SimpleNamespace(state_dict=lambda: {"weight": np.array([self.weight])})
+        def predict(self, **kwargs):
+            boxes = types.SimpleNamespace(xyxy=np.array([[10, 10, 30, 50]]), conf=np.array([.8]), cls=np.array([0]))
+            return [types.SimpleNamespace(boxes=boxes, masks=None)]
+
+    with box_first_environment(root), mock.patch.object(app, "load_text_localizer", side_effect=lambda *args: WeightedLocalizer()):
+        assert app.main(["--config", str(config_path)]) == 0
+        raw = root / "output/raw_predictions"
+        assert app.main(["--config", str(config_path)]) == 0
+        before = {str(path): path.read_bytes() for path in raw.rglob("*") if path.is_file()}
+        WeightedLocalizer.weight = 2.
         assert app.main(["--config", str(config_path)]) == 2
         assert {str(path): path.read_bytes() for path in raw.rglob("*") if path.is_file()} == before
 

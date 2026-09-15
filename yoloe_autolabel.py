@@ -84,6 +84,7 @@ _OFFICIAL_YOLOE_ALIASES = frozenset(
     for family in ("v8", "11", "26")
     for size in ("n", "s", "m", "l", "x")
 )
+_GEOMETRY_REJECTION_KEYS = ("non_finite", "zero_area", "too_small", "too_large", "aspect_ratio")
 
 
 def _positive_integer(value: Any, label: str) -> int:
@@ -866,7 +867,7 @@ def _positive_arg(value: str) -> int:
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Generate raw YOLO labels with YOLOE visual prompts")
+    parser = argparse.ArgumentParser(description="Generate raw YOLO labels with box-first localization and conservative SKU suggestions")
     parser.add_argument("--config", required=True)
     parser.add_argument("--output")
     parser.add_argument("--overwrite", action="store_true", default=None)
@@ -948,6 +949,41 @@ def _read_provenance(path: Path) -> dict[str, Any] | None:
     if not isinstance(data, dict) or not isinstance(data.get("fingerprint"), str):
         raise ValueError(f"Existing provenance is malformed: {source}")
     return data
+
+
+def _runtime_weight_fingerprint(model: Any) -> str | None:
+    """Hash available loaded weights, without fabricating state for test doubles."""
+    import inspect
+
+    # Some proxy/test objects fabricate any attribute on access. Only hash
+    # a state_dict that actually exists on the instance or its class.
+    if inspect.getattr_static(model, "state_dict", None) is None:
+        return None
+    state_dict = getattr(model, "state_dict", None)
+    if not callable(state_dict):
+        return None
+    state = state_dict()
+    if not isinstance(state, Mapping):
+        raise ValueError("Runtime model state_dict must be a mapping")
+    digest = hashlib.sha256()
+    for name in sorted(state):
+        value = state[name]
+        for method in ("detach", "cpu", "contiguous"):
+            function = getattr(value, method, None)
+            if callable(function):
+                value = function()
+        descriptor = json.dumps([name, str(value.dtype), list(value.shape)], separators=(",", ":"))
+        try:
+            payload = _as_numpy(value).tobytes(order="C")
+        except TypeError:
+            # NumPy cannot represent torch.bfloat16. Viewing bytes preserves
+            # its exact dtype and values rather than casting the weights.
+            import torch
+            payload = value.reshape(-1).view(torch.uint8).numpy().tobytes(order="C")
+        for part in (descriptor.encode("utf-8"), payload):
+            digest.update(len(part).to_bytes(8, "big"))
+            digest.update(part)
+    return digest.hexdigest()
 
 
 def _validate_completion_markers(
@@ -1104,6 +1140,17 @@ def build_runtime_matcher(
         if reference.class_id not in views:
             continue
         image = decoded_references[reference.image_path]
+        if reference.bbox is not None:
+            x1, y1, x2, y2 = validate_reference(reference, image, {sku.class_id: sku for sku in active_skus})
+            # An explicit source ROI is authoritative: automatic localization
+            # must not substitute a detection elsewhere in the source image.
+            views[reference.class_id].append(image[y1:y2, x1:x2, ::-1].copy())
+            diagnostics.append({
+                "class_id": reference.class_id, "image_path": str(reference.image_path),
+                "source_roi_xyxy": [x1, y1, x2, y2], "derived_views": 1,
+                "fallback_full_image": False, "localization": {"mode": "explicit_source_roi"},
+            })
+            continue
         candidates, localization = localize_reference_image(localizer, image, localization_config, imgsz, device)
         derived, records = derive_reference_views(
             {reference.class_id: image}, {reference.class_id: candidates}, matching_config.max_reference_views
@@ -1169,7 +1216,7 @@ def _classified_records(
         records.append({**row, "xyxy": [x1, y1, x2, y2], "rankings": [asdict(rank) for rank in item.rankings[:3]]})
         predictions.append(Prediction(class_id, 0, row["assigned_barcode"], row["assigned_name"],
                                       item.rankings[0].score if item.rankings else 0., (x1, y1, x2, y2), 0))
-    rejected = {key: value for key, value in localization.items() if key.startswith("rejected_")}
+    rejected = {key: localization.get(key, 0) for key in _GEOMETRY_REJECTION_KEYS}
     metadata = {
         "image_path": str(image_path), "image_width": width, "image_height": height,
         "localization": dict(localization), "predictions": records,
@@ -1190,6 +1237,30 @@ def _save_review_queue(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
     writer.writeheader()
     writer.writerows(sorted(rows, key=lambda row: (str(row["image"]).casefold(), str(row["image"]), int(row["box_index"]))))
     _atomic_write_text(path, buffer.getvalue(), True)
+
+
+def _validate_retained_review_queue(
+    rows: Sequence[Mapping[str, Any]], image_records: Mapping[str, Mapping[str, Any]],
+) -> None:
+    """Require every retained CSV field to agree with mandatory image metadata."""
+    expected = []
+    for image_name, metadata in image_records.items():
+        predictions = metadata["predictions"]
+        if metadata["candidate_count"] != len(predictions):
+            raise ValueError("Retained metadata candidate_count disagrees with predictions")
+        for index, record in enumerate(predictions):
+            if record["image"] != image_name or record["box_index"] != index:
+                raise ValueError("Retained metadata has inconsistent review-row identities")
+            # Non-ranking fields are mandatory. Unavailable top-2/top-3
+            # suggestions are the empty fields written by DictWriter.
+            expected.append(tuple(str(record[key]) if key in record else "" for key in _REVIEW_COLUMNS))
+    actual = []
+    for row in rows:
+        if set(row) != set(_REVIEW_COLUMNS) or any(value is None for value in row.values()):
+            raise ValueError("Existing review_queue.csv contains malformed rows")
+        actual.append(tuple(row[key] for key in _REVIEW_COLUMNS))
+    if sorted(actual) != sorted(expected):
+        raise ValueError("Existing review_queue.csv disagrees with retained per-image metadata; regenerate explicitly with --overwrite")
 
 
 def _score_summary(scores: Sequence[float]) -> dict[str, int | float | None]:
@@ -1248,7 +1319,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         skus = load_sku_manifest(manifest_path)
         references = load_reference_definitions(references_path, skus, config_path.parent)
-        active_skus = select_active_skus(skus, pilot)
+        # Pilot limits apply to shelf images, never to the SKU matching bank.
+        active_skus = select_active_skus(skus, {"enabled": False})
         if 89 in skus:
             raise ValueError("Class 89 is reserved for Needs Review and cannot be a permanent SKU")
         enabled_count = sum(item.enabled for item in skus.values())
@@ -1324,7 +1396,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 reader = csv.DictReader(handle)
                 if tuple(reader.fieldnames or ()) != _REVIEW_COLUMNS:
                     raise ValueError("Existing review_queue.csv has incompatible columns")
-                review_rows = [row for row in reader if Path(row["image"]).stem in retained_stems]
+                queued_rows = list(reader)
+                if any(set(row) != set(_REVIEW_COLUMNS) or any(value is None for value in row.values()) for row in queued_rows):
+                    raise ValueError("Existing review_queue.csv contains malformed rows")
+                review_rows = [row for row in queued_rows if Path(row["image"]).stem in retained_stems]
             for marker in retained_labels:
                 metadata_path = paths["metadata"] / f"{marker.stem}.json"
                 _validate_input_output_separation(paths, input_files, [images_root], [metadata_path])
@@ -1336,6 +1411,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                                row["rankings"][0]["score"] if row["rankings"] else 0., tuple(row["xyxy"]), 0)
                     for row in metadata["predictions"]
                 ]
+            _validate_retained_review_queue(review_rows, image_records)
 
         model = load_text_localizer(model_path, pipeline.localization.prompts)
         backend, bank, reference_diagnostics = build_runtime_matcher(
@@ -1343,6 +1419,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             localizer=model, localization_config=pipeline.localization, matching_config=pipeline.matching,
             imgsz=yoloe_settings["imgsz"], device=yoloe_settings["device"],
         )
+        runtime_weights = {
+            "yoloe": _runtime_weight_fingerprint(getattr(model, "model", model)),
+            "openclip": _runtime_weight_fingerprint(getattr(backend, "_model", None)),
+        }
+        if matching_resume and existing_provenance.get("runtime_weight_fingerprints") != runtime_weights:
+            raise ValueError("Existing labels have incompatible runtime model weights; use --overwrite to regenerate them")
+        # Runtime state is separate from the model-free configuration digest.
+        provenance["runtime_weight_fingerprints"] = runtime_weights
         paths = prepare_output_paths(output_root)
         if overwrite:
             _invalidate_labels(completed_labels, paths["labels"], paths["raw_predictions"], input_files)
@@ -1415,8 +1499,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "config": _json_ready(config),
                 "images": image_records,
                 "totals": {
-                    key: sum(record.get(key, 0) for record in image_records.values())
-                    for key in ("candidate_count", "duplicates_removed", "assigned_permanent_count", "needs_review_count")
+                    "geometry_rejections": {
+                        key: sum(record.get("geometry_rejections", {}).get(key, 0) for record in image_records.values())
+                        for key in _GEOMETRY_REJECTION_KEYS
+                    },
+                    **{
+                        key: sum(record.get(key, 0) for record in image_records.values())
+                        for key in ("candidate_count", "duplicates_removed", "assigned_permanent_count", "needs_review_count")
+                    },
                 },
                 "score_summaries": {
                     f"top{rank_index + 1}": _score_summary([

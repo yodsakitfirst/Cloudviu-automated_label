@@ -280,8 +280,14 @@ def _load_cv2():
 
 
 def _validate_decodable_image(path: Path, label: str) -> None:
+    import numpy as np
+
     cv2 = _load_cv2()
-    image = cv2.imread(str(path))
+    try:
+        encoded = np.frombuffer(Path(path).read_bytes(), dtype=np.uint8)
+        image = cv2.imdecode(encoded, cv2.IMREAD_COLOR) if encoded.size else None
+    except (OSError, cv2.error) as exc:
+        raise ValueError(f"{label} cannot be decoded: {path}") from exc
     if image is None or image.ndim < 2 or image.shape[0] <= 0 or image.shape[1] <= 0:
         raise ValueError(f"{label} cannot be decoded: {path}")
 
