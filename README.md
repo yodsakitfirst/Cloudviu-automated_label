@@ -4,22 +4,24 @@ This repository contains a small visual-prompting tool for bootstrapping **raw c
 
 ## Current implementation state
 
-The reusable tool, schemas, and offline test suite are included. The repository does **not** currently contain the business workbook, verified SKU selection rule, reference product images, or shelf images. Consequently:
+The supplied HAIR dataset has been validated and packaged for Colab Enterprise:
 
-- `sku_manifest.csv` and `reference_prompts.yaml` are intentionally empty templates;
-- the one-image model smoke test and 5-SKU/10-image pilot cannot yet run;
-- the exact 79-class V1 scope is **blocked**, and no full run should be attempted;
-- no SKU may be guessed, dropped, reordered, or renumbered merely to reach 79.
+- the 89 rows in workbook `Sheet2` are permanent class IDs `0` through `88`, in workbook row order;
+- every class has one verified product reference;
+- all 632 shelf images are processed against all 89 classes, regardless of supermarket;
+- product-reference paths use `class_<three-digit-id>_<barcode>.<extension>` ASCII names;
+- Thai product names and barcode values remain intact inside `sku_manifest.csv`;
+- `dist/hair_colab_runtime.zip` is the uploadable runtime package and is intentionally ignored by Git.
 
-When source data becomes available, document the workbook filename, sheet, relevant columns, exact selection rule, selected-row count, duplicate resolution, and deterministic class-order rule here before enabling a full run.
+The original workbook and images under `/Users/me/Downloads/Cloudviu-data` are never renamed or modified by the package builder.
 
 ## Why detection comes first
 
-The eventual OSA layer can reduce reviewed detections to `present = 1` when a SKU is detected at least once and `absent = 0` otherwise. This tool addresses the earlier problem: the first custom detector needs reviewed boxes for every visible target instance, but no trusted detector or 79-class box dataset exists yet. YOLOE suggestions may reduce manual effort; they do not remove manual review.
+The eventual OSA layer can reduce reviewed detections to `present = 1` when a SKU is detected at least once and `absent = 0` otherwise. This tool addresses the earlier problem: the first custom detector needs reviewed boxes for every visible target instance, but no trusted detector or 89-class box dataset exists yet. YOLOE suggestions may reduce manual effort; they do not remove manual review.
 
 ## Requirements
 
-- Python 3.11 is the supported runtime.
+- Python 3.11 or 3.12 is supported.
 - A CUDA-capable GPU is strongly recommended for real YOLOE inference.
 - Ultralytics is pinned to `8.4.149` because the visual-prompt API is version-sensitive.
 - The default checkpoint is `yoloe-26l-seg.pt`; only its boxes are exported.
@@ -42,15 +44,18 @@ py -3.11 -m venv .venv
 .venv\Scripts\python.exe yoloe_autolabel.py --config config.yaml
 ```
 
-Colab:
+For Colab Enterprise, use [colab/README.md](colab/README.md) and import `colab/hair_colab_enterprise.ipynb`. The workflow uses only runtime storage and contains no Drive mount or Cloud Storage integration. Dataset, output, and reference-image paths are resolved from the directory containing `config.yaml`. Recognized official aliases such as `yoloe-26l-seg.pt` are delegated unchanged to Ultralytics; custom checkpoint paths resolve from the configuration directory.
 
-```python
-!pip install ultralytics==8.4.149 "numpy>=2.0,<3" "pandas>=2.2,<3" "PyYAML>=6.0,<7" "opencv-python>=4.10,<5"
-!python yoloe_autolabel.py --config config.yaml --validate-only
-!python yoloe_autolabel.py --config config.yaml
+Rebuild the upload archive from the supplied source data with:
+
+```bash
+.venv/bin/python prepare_hair_colab.py \
+  --workbook "/Users/me/Downloads/Cloudviu-data/HAIR SKU list (with Account list).xlsx" \
+  --product-images "/Users/me/Downloads/Cloudviu-data/HAIR_product_images" \
+  --shelf-images "/Users/me/Downloads/Cloudviu-data/HAIR_shelf_images" \
+  --metadata-output colab/generated \
+  --output dist/hair_colab_runtime.zip
 ```
-
-The same commands apply to Colab Enterprise after placing the repository and data on its filesystem. Dataset, output, and reference-image paths in the configuration are resolved from the directory containing the main `config.yaml`, even when the reference YAML lives in a nested directory. Recognized bare official YOLOE aliases such as `yoloe-26l-seg.pt` are delegated unchanged to Ultralytics; custom checkpoint names and paths, including a bare `custom.pt`, resolve from the main config directory.
 
 ## Input layout and schemas
 
@@ -61,7 +66,7 @@ config.yaml
 sku_manifest.csv
 reference_prompts.yaml
 references/
-  product-reference-images...
+  class_000_0012345678905.jpg
 shelf_images/
   shelf-images...
 ```
@@ -80,9 +85,9 @@ Reference definitions allow multiple views of one SKU:
 ```yaml
 references:
   - class_id: 0
-    image: references/000_0012345678905_front.jpg
+    image: references/class_000_0012345678905.jpg
   - class_id: 0
-    image: references/000_0012345678905_side.jpg
+    image: references/class_000_0012345678905_side.jpg
     bbox: [12, 8, 492, 995]
 ```
 
@@ -112,13 +117,13 @@ python yoloe_autolabel.py --config config.yaml --validate-only
 
 It checks configuration types and positive sizes, manifest identifiers, reference files and boxes, active-class selection, shelf image discovery, duplicate image stems, output safety, and any required enabled count.
 
-The full V1 gate is stricter:
+The HAIR dataset gate is stricter:
 
 ```bash
-python yoloe_autolabel.py --config config.yaml --validate-only --require-enabled-count 79
+python yoloe_autolabel.py --config config.yaml --validate-only --require-enabled-count 89
 ```
 
-Keep this command blocked until a source-backed rule produces exactly 79 unique enabled SKUs and each has a valid reference. The script supports any positive enabled-class count; 79 is a dataset gate, not a hard-coded algorithm limit.
+The prepared archive passes this gate with 89 unique enabled SKUs, 89 references, and 632 shelf images. The script itself supports any positive enabled-class count; 89 is a dataset gate rather than a hard-coded algorithm limit.
 
 CLI overrides are available for controlled runs:
 
@@ -169,7 +174,7 @@ Metadata retains the source path/dimensions, model and Ultralytics version, devi
 
 Import the original shelf images and matching files from `raw_predictions/labels` into CVAT using its YOLO detection format. Class order must match permanent manifest IDs. Reviewers must delete false positives, correct wrong classes, add missed instances, and repair poor boxes. Export reviewed labels to a separate `reviewed_labels/` tree.
 
-Only the reviewed images and labels should train the first normal 79-class YOLO detector. The raw candidates are audit material, not training truth.
+Only the reviewed images and labels should train the first normal 89-class YOLO detector. The raw candidates are audit material, not training truth.
 
 ## Known limitations
 
@@ -186,7 +191,7 @@ Only the reviewed images and labels should train the first normal 79-class YOLO 
 - **Weight download failure:** obtain the pinned checkpoint through an approved network path and retry; do not substitute an undocumented API.
 - **Invalid references:** verify the file decodes and that `[x1,y1,x2,y2]` lies inside the image with positive area.
 - **Duplicate stems:** rename sources only through an approved data-management step, or place them in a separately designed unique-output scheme; this tool stops before overwriting.
-- **79-SKU ambiguity:** stop the full run. Record the source gap and continue only with a separately verified subset.
+- **Unexpected class count:** rebuild the package from the verified `Sheet2` source and require exactly 89 enabled classes.
 
 Run automated checks without weights or a GPU:
 
