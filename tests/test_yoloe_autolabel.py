@@ -330,7 +330,7 @@ class BatchAndInferenceTests(unittest.TestCase):
         predictor = object()
         fake_module = types.SimpleNamespace(YOLOEVPSegPredictor=predictor)
         batch = app.PromptBatch(3, (2, 9), {0: 2, 1: 9}, Path("canvas.jpg"), np.array([[0, 0, 2, 2]]), np.array([0]))
-        with mock.patch.dict(sys.modules, {"ultralytics.models.yolo.yoloe.predict_vp": fake_module}):
+        with mock.patch.dict(sys.modules, {"ultralytics.models.yolo.yoloe": fake_module}):
             predictions = app.run_yoloe(model, Path("shelf.jpg"), batch, {"imgsz": 640, "conf": .2, "iou": .7, "device": "cpu"}, {2: sku(2), 9: sku(9)})
         self.assertEqual([p.dataset_class_id for p in predictions], [2, 9])
         self.assertEqual(predictions[0].prompt_batch, 3)
@@ -339,7 +339,7 @@ class BatchAndInferenceTests(unittest.TestCase):
     def test_run_yoloe_empty_and_malformed_outputs(self):
         fake_module = types.SimpleNamespace(YOLOEVPSegPredictor=object())
         batch = app.PromptBatch(0, (2,), {0: 2}, Path("c.jpg"), np.empty((0, 4)), np.empty((0,)))
-        with mock.patch.dict(sys.modules, {"ultralytics.models.yolo.yoloe.predict_vp": fake_module}):
+        with mock.patch.dict(sys.modules, {"ultralytics.models.yolo.yoloe": fake_module}):
             empty = mock.Mock()
             empty.predict.return_value = [types.SimpleNamespace(boxes=types.SimpleNamespace(xyxy=np.empty((0, 4)), conf=np.array([]), cls=np.array([])))]
             self.assertEqual(app.run_yoloe(empty, Path("x.jpg"), batch, {"imgsz": 1, "conf": 0, "iou": 0, "device": "cpu"}, {2: sku(2)}), [])
@@ -358,7 +358,7 @@ class BatchAndInferenceTests(unittest.TestCase):
             (np.array([[1, 2, 3, 4]], float), np.array([1.1], float), np.array([0], float)),
             (np.array([[1, 2, 3, 4]], float), np.array([math.nan], float), np.array([0], float)),
         ]
-        with mock.patch.dict(sys.modules, {"ultralytics.models.yolo.yoloe.predict_vp": fake_module}):
+        with mock.patch.dict(sys.modules, {"ultralytics.models.yolo.yoloe": fake_module}):
             for xyxy, conf, cls in cases:
                 with self.subTest(xyxy=xyxy, conf=conf):
                     model = mock.Mock()
@@ -567,7 +567,7 @@ class CliTests(unittest.TestCase):
             cli_paths = app.prepare_output_paths(root / "cli-output")
             label = cli_paths["labels"] / "shelf.txt"
             label.write_text("sentinel\n", encoding="utf-8")
-            with mock.patch.dict(sys.modules, {"ultralytics.models.yolo.yoloe.predict_vp": predictor_module}), mock.patch.object(app, "_load_cv2", return_value=cv2), mock.patch.object(app, "load_yoloe", return_value=model), mock.patch.object(app, "_ultralytics_version", return_value="test"):
+            with mock.patch.dict(sys.modules, {"ultralytics.models.yolo.yoloe": predictor_module}), mock.patch.object(app, "_load_cv2", return_value=cv2), mock.patch.object(app, "load_yoloe", return_value=model), mock.patch.object(app, "_ultralytics_version", return_value="test"):
                 skipped = app.main(["--config", str(config_path), "--output", "cli-output"])
                 self.assertEqual(label.read_text(encoding="utf-8"), "sentinel\n")
                 result = app.main(["--config", str(config_path), "--output", "cli-output", "--overwrite"])
@@ -600,7 +600,7 @@ class CliTests(unittest.TestCase):
             model, cv2, predictor_module = fake_inference_environment(root)
             real_save_labels = app.save_yolo_labels
             environment = mock.patch.multiple(app, _load_cv2=mock.DEFAULT, load_yoloe=mock.DEFAULT, _ultralytics_version=mock.DEFAULT)
-            with mock.patch.dict(sys.modules, {"ultralytics.models.yolo.yoloe.predict_vp": predictor_module}), environment as patched:
+            with mock.patch.dict(sys.modules, {"ultralytics.models.yolo.yoloe": predictor_module}), environment as patched:
                 patched["_load_cv2"].return_value = cv2
                 patched["load_yoloe"].return_value = model
                 patched["_ultralytics_version"].return_value = "test"
@@ -623,7 +623,7 @@ class CliTests(unittest.TestCase):
             model, cv2, predictor_module = fake_inference_environment(root)
             real_save_labels = app.save_yolo_labels
             raw = root / "output" / "raw_predictions"
-            with mock.patch.dict(sys.modules, {"ultralytics.models.yolo.yoloe.predict_vp": predictor_module}), mock.patch.object(app, "_load_cv2", return_value=cv2), mock.patch.object(app, "load_yoloe", return_value=model), mock.patch.object(app, "_ultralytics_version", return_value="test"):
+            with mock.patch.dict(sys.modules, {"ultralytics.models.yolo.yoloe": predictor_module}), mock.patch.object(app, "_load_cv2", return_value=cv2), mock.patch.object(app, "load_yoloe", return_value=model), mock.patch.object(app, "_ultralytics_version", return_value="test"):
                 self.assertEqual(app.main(["--config", str(config_path)]), 0)
                 label = raw / "labels" / "shelf.txt"
                 self.assertTrue(label.exists())
@@ -677,7 +677,7 @@ class CliTests(unittest.TestCase):
             root = Path(td)
             config_path = write_project(root)
             model, cv2, predictor_module = fake_inference_environment(root)
-            with mock.patch.dict(sys.modules, {"ultralytics.models.yolo.yoloe.predict_vp": predictor_module}), mock.patch.object(app, "_load_cv2", return_value=cv2), mock.patch.object(app, "load_yoloe", return_value=model), mock.patch.object(app, "_ultralytics_version", return_value="test"):
+            with mock.patch.dict(sys.modules, {"ultralytics.models.yolo.yoloe": predictor_module}), mock.patch.object(app, "_load_cv2", return_value=cv2), mock.patch.object(app, "load_yoloe", return_value=model), mock.patch.object(app, "_ultralytics_version", return_value="test"):
                 self.assertEqual(app.main(["--config", str(config_path)]), 0)
                 raw = root / "output" / "raw_predictions"
                 provenance = raw / "provenance.json"
@@ -694,7 +694,7 @@ class CliTests(unittest.TestCase):
                 root = Path(td)
                 config_path = write_project(root)
                 model, cv2, predictor_module = fake_inference_environment(root)
-                with mock.patch.dict(sys.modules, {"ultralytics.models.yolo.yoloe.predict_vp": predictor_module}), mock.patch.object(app, "_load_cv2", return_value=cv2), mock.patch.object(app, "load_yoloe", return_value=model), mock.patch.object(app, "_ultralytics_version", return_value="test"):
+                with mock.patch.dict(sys.modules, {"ultralytics.models.yolo.yoloe": predictor_module}), mock.patch.object(app, "_load_cv2", return_value=cv2), mock.patch.object(app, "load_yoloe", return_value=model), mock.patch.object(app, "_ultralytics_version", return_value="test"):
                     self.assertEqual(app.main(["--config", str(config_path)]), 0)
                     canvas = root / "output" / "raw_predictions" / "prompt_canvases" / "batch_000.png"
                     canvas.write_bytes(b"old-provenance-canvas")
@@ -713,7 +713,7 @@ class CliTests(unittest.TestCase):
                 root = Path(td)
                 config_path = write_project(root)
                 model, cv2, predictor_module = fake_inference_environment(root)
-                with mock.patch.dict(sys.modules, {"ultralytics.models.yolo.yoloe.predict_vp": predictor_module}), mock.patch.object(app, "_load_cv2", return_value=cv2), mock.patch.object(app, "load_yoloe", return_value=model), mock.patch.object(app, "_ultralytics_version", return_value="test"):
+                with mock.patch.dict(sys.modules, {"ultralytics.models.yolo.yoloe": predictor_module}), mock.patch.object(app, "_load_cv2", return_value=cv2), mock.patch.object(app, "load_yoloe", return_value=model), mock.patch.object(app, "_ultralytics_version", return_value="test"):
                     self.assertEqual(app.main(["--config", str(config_path)]), 0)
                     raw = root / "output" / "raw_predictions"
                     old_label = raw / "labels" / "shelf.txt"
@@ -750,7 +750,7 @@ class CliTests(unittest.TestCase):
             before = shelf.read_bytes()
             model, cv2, predictor_module = fake_inference_environment(root)
             cv2.images[str(shelf)] = np.zeros((20, 30, 3), np.uint8)
-            with mock.patch.dict(sys.modules, {"ultralytics.models.yolo.yoloe.predict_vp": predictor_module}), mock.patch.object(app, "_load_cv2", return_value=cv2), mock.patch.object(app, "load_yoloe", return_value=model) as loader:
+            with mock.patch.dict(sys.modules, {"ultralytics.models.yolo.yoloe": predictor_module}), mock.patch.object(app, "_load_cv2", return_value=cv2), mock.patch.object(app, "load_yoloe", return_value=model) as loader:
                 result = app.main(["--config", str(config_path)])
             self.assertNotEqual(result, 0)
             loader.assert_not_called()
@@ -766,7 +766,7 @@ class CliTests(unittest.TestCase):
                     config = valid_config(yoloe={"model": model_value})
                     config_path = write_project(run_root, config)
                     model, cv2, predictor_module = fake_inference_environment(run_root)
-                    with mock.patch.dict(sys.modules, {"ultralytics.models.yolo.yoloe.predict_vp": predictor_module}), mock.patch.object(app, "_load_cv2", return_value=cv2), mock.patch.object(app, "load_yoloe", return_value=model) as loader, mock.patch.object(app, "_ultralytics_version", return_value="test"):
+                    with mock.patch.dict(sys.modules, {"ultralytics.models.yolo.yoloe": predictor_module}), mock.patch.object(app, "_load_cv2", return_value=cv2), mock.patch.object(app, "load_yoloe", return_value=model) as loader, mock.patch.object(app, "_ultralytics_version", return_value="test"):
                         self.assertEqual(app.main(["--config", str(config_path)]), 0)
                     if model_value == "yoloe-26l-seg.pt":
                         wanted = model_value

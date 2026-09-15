@@ -544,7 +544,7 @@ def run_yoloe(
     _reject_reviewed_labels(Path(source))
     _reject_reviewed_labels(Path(batch.canvas_path))
     try:
-        from ultralytics.models.yolo.yoloe.predict_vp import YOLOEVPSegPredictor
+        from ultralytics.models.yolo.yoloe import YOLOEVPSegPredictor
 
         results = model.predict(
             source=str(source),
