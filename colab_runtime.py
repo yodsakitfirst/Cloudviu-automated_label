@@ -91,34 +91,27 @@ def write_pilot_config(
     return destination
 
 
-def package_results(project: Path, destination: Path) -> Path:
-    """Atomically package only full-run raw predictions for download."""
-    project_root = Path(project).resolve()
-    raw_predictions = project_root / "output" / "raw_predictions"
-    if not raw_predictions.is_dir():
-        raise ValueError(f"No full-run raw predictions found: {raw_predictions}")
-    files = sorted(
-        (path for path in raw_predictions.rglob("*") if path.is_file()),
-        key=lambda path: path.as_posix(),
-    )
-    if not files:
-        raise ValueError(f"No full-run raw predictions found: {raw_predictions}")
-    output_path = Path(destination).resolve()
-    if output_path.exists():
-        raise FileExistsError(f"Results archive already exists: {output_path}")
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".{output_path.stem}.", suffix=".zip", dir=output_path.parent
-    )
-    os.close(descriptor)
-    temporary = Path(temporary_name)
-    try:
-        with zipfile.ZipFile(temporary, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
-            for source in files:
-                relative = source.relative_to(raw_predictions)
-                archive.write(source, (Path("raw_predictions") / relative).as_posix())
-        os.replace(temporary, output_path)
-    except Exception:
-        temporary.unlink(missing_ok=True)
-        raise
-    return output_path
+def package_results(
+    project: Path,
+    platform_destination: Path,
+    review_destination: Path,
+    *,
+    overwrite: bool = False,
+) -> tuple[Path, Path]:
+    """Build separate Platform/review ZIPs after preflighting both archives."""
+    from hair_annotation import export
+
+    settings = export._project_settings(project)
+    platform_members = export._platform_members(settings, settings.export)
+    review_members = export._review_members(settings)
+    inputs = export._member_inputs(settings, [*platform_members, *review_members])
+    platform_path = export._destination(platform_destination, inputs, overwrite)
+    review_path = export._destination(review_destination, inputs, overwrite)
+    aliases = platform_path == review_path
+    if platform_path.exists() and review_path.exists():
+        aliases = aliases or os.path.samefile(platform_path, review_path)
+    if aliases:
+        raise ValueError("Platform and review destinations must be distinct, not aliases")
+    platform_path = export._atomic_archive(platform_path, platform_members, inputs, overwrite)
+    review_path = export._atomic_archive(review_path, review_members, inputs, overwrite)
+    return platform_path, review_path
