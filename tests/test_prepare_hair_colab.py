@@ -276,3 +276,44 @@ def test_failed_package_build_leaves_no_final_archive(package_fixture, tmp_path)
         prep.build_runtime_package(package_fixture, destination)
 
     assert not destination.exists()
+
+
+def test_cli_metadata_output_contains_only_registry_files(package_fixture, tmp_path):
+    metadata = tmp_path / "generated"
+    destination = tmp_path / "hair_colab_runtime.zip"
+
+    result = prep.main(
+        [
+            "--workbook",
+            str(package_fixture.workbook),
+            "--product-images",
+            str(package_fixture.product_images),
+            "--shelf-images",
+            str(package_fixture.shelf_images),
+            "--repo-root",
+            str(package_fixture.repo_root),
+            "--overrides",
+            str(package_fixture.overrides),
+            "--output",
+            str(destination),
+            "--metadata-output",
+            str(metadata),
+            "--expected-skus",
+            "2",
+            "--expected-shelves",
+            "2",
+        ]
+    )
+
+    assert result == 0
+    assert sorted(path.name for path in metadata.iterdir()) == [
+        "reference_prompts.yaml",
+        "sku_manifest.csv",
+    ]
+    with zipfile.ZipFile(destination) as archive:
+        assert (metadata / "sku_manifest.csv").read_bytes() == archive.read(
+            "hair_colab/sku_manifest.csv"
+        )
+        assert (metadata / "reference_prompts.yaml").read_bytes() == archive.read(
+            "hair_colab/reference_prompts.yaml"
+        )

@@ -357,6 +357,48 @@ def _zip_tree(package_root: Path, destination: Path) -> None:
             archive.write(path, archive_name.as_posix())
 
 
+def export_registry_metadata(
+    archive_path: Path,
+    destination: Path,
+    overwrite: bool = False,
+) -> Path:
+    """Export the archive's exact generated registry files atomically."""
+    source_archive = Path(archive_path).resolve()
+    output_directory = Path(destination).resolve()
+    if output_directory.exists() and not overwrite:
+        raise FileExistsError(f"Metadata directory already exists: {output_directory}")
+    if output_directory.exists() and not output_directory.is_dir():
+        raise ValueError(f"Metadata destination is not a directory: {output_directory}")
+    output_directory.parent.mkdir(parents=True, exist_ok=True)
+    members = {
+        "hair_colab/sku_manifest.csv": "sku_manifest.csv",
+        "hair_colab/reference_prompts.yaml": "reference_prompts.yaml",
+    }
+    with tempfile.TemporaryDirectory(
+        prefix=".hair-colab-metadata-", dir=output_directory.parent
+    ) as temporary_directory:
+        temporary_root = Path(temporary_directory)
+        staged = temporary_root / "generated"
+        staged.mkdir()
+        try:
+            with zipfile.ZipFile(source_archive) as archive:
+                for member, filename in members.items():
+                    (staged / filename).write_bytes(archive.read(member))
+        except (OSError, KeyError, zipfile.BadZipFile) as exc:
+            raise ValueError(f"Cannot export registry metadata from {source_archive}: {exc}") from exc
+
+        backup = temporary_root / "previous"
+        if output_directory.exists():
+            os.replace(output_directory, backup)
+        try:
+            os.replace(staged, output_directory)
+        except Exception:
+            if backup.exists() and not output_directory.exists():
+                os.replace(backup, output_directory)
+            raise
+    return output_directory
+
+
 def build_runtime_package(
     inputs: PackageInputs,
     destination: Path,
@@ -423,6 +465,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--repo-root", default=str(Path(__file__).resolve().parent))
     parser.add_argument("--overrides", default="colab/reference_name_overrides.yaml")
     parser.add_argument("--output", default="dist/hair_colab_runtime.zip")
+    parser.add_argument("--metadata-output")
     parser.add_argument("--expected-skus", type=_positive_argument, default=89)
     parser.add_argument("--expected-shelves", type=_positive_argument, default=632)
     parser.add_argument("--overwrite", action="store_true")
@@ -449,6 +492,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"Created {report.archive_path}: {report.sku_count} SKUs, "
             f"{report.reference_count} references, {report.shelf_count} shelf images"
         )
+        if args.metadata_output:
+            metadata_path = export_registry_metadata(
+                report.archive_path,
+                Path(args.metadata_output),
+                overwrite=args.overwrite,
+            )
+            print(f"Exported registry metadata to {metadata_path}")
         return 0
     except Exception as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
