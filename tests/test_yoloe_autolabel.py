@@ -6,12 +6,14 @@ import sys
 import tempfile
 import types
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 from unittest import mock
 
 import numpy as np
 
 import yoloe_autolabel as app
+from hair_annotation.types import Candidate, ClassifiedCandidate, RankedSku
 
 
 class FakeCv2:
@@ -21,6 +23,7 @@ class FakeCv2:
     def __init__(self, images=None):
         self.images = {str(Path(k).resolve()): v for k, v in (images or {}).items()}
         self.writes = {}
+        self.texts = []
 
     def imread(self, path):
         image = self.images.get(str(Path(path).resolve()))
@@ -39,11 +42,12 @@ class FakeCv2:
         image[max(0, pt1[1]) : min(image.shape[0], pt1[1] + 1)] = color
 
     def putText(self, image, text, origin, font, scale, color, thickness, line):
+        self.texts.append(text)
         image[max(0, origin[1] - 1) : min(image.shape[0], origin[1])] = color
 
 
 def sku(class_id, enabled=True, barcode=None):
-    return app.Sku(class_id, barcode or f"00{class_id}", "Brand", f"SKU {class_id}", enabled)
+    return app.Sku(class_id, barcode or f"00{class_id}", "Brand", f"SKU {class_id}", enabled, f"Thai {class_id}")
 
 
 def valid_config(**overrides):
@@ -115,7 +119,9 @@ def fake_inference_environment(root, predictions=None):
 class ManifestTests(unittest.TestCase):
     def write_manifest(self, root, rows, columns=None):
         path = root / "sku.csv"
-        columns = columns or ["class_id", "barcode", "brand", "sku_name", "enabled"]
+        columns = columns or ["class_id", "barcode", "brand", "sku_name", "enabled", "sku_name_th"]
+        if "sku_name_th" in columns:
+            rows = [{"sku_name_th": " Thai name ", **row} for row in rows]
         with path.open("w", newline="", encoding="utf-8") as handle:
             writer = csv.DictWriter(handle, fieldnames=columns)
             writer.writeheader()
@@ -126,7 +132,7 @@ class ManifestTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             path = self.write_manifest(Path(td), [{"class_id": " 7 ", "barcode": " 001234 ", "brand": " Acme ", "sku_name": " Tea ", "enabled": " TRUE "}])
             actual = app.load_sku_manifest(path)
-        self.assertEqual(actual[7], app.Sku(7, "001234", "Acme", "Tea", True))
+        self.assertEqual(actual[7], app.Sku(7, "001234", "Acme", "Tea", True, "Thai name"))
 
     def test_manifest_rejects_invalid_shapes_and_values(self):
         invalid_rows = [
@@ -426,7 +432,7 @@ class ConversionAndOutputTests(unittest.TestCase):
             root = Path(td) / "out"
             paths = app.prepare_output_paths(root)
             self.assertEqual(paths["labels"], root.resolve() / "raw_predictions" / "labels")
-            self.assertTrue(paths["prompt_canvases"].is_dir())
+            self.assertTrue(paths["labels"].is_dir())
             with self.assertRaises(ValueError):
                 app.prepare_output_paths(Path(td) / "reviewed_labels" / "run")
             with self.assertRaises(ValueError):
@@ -519,6 +525,11 @@ class ConversionAndOutputTests(unittest.TestCase):
 
 
 class CliTests(unittest.TestCase):
+    def setUp(self):
+        patcher = mock.patch.object(app, "OpenClipBackend", ColorEmbeddingBackend)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_cli_precedence_and_positive_gate(self):
         args = app.parse_args(["--config", "c.yaml", "--output", "override", "--overwrite", "--require-enabled-count", "4"])
         self.assertEqual(args.output, "override")
@@ -540,7 +551,7 @@ class CliTests(unittest.TestCase):
             ManifestTests().write_manifest(root, [{"class_id": "2", "barcode": "002", "brand": "B", "sku_name": "N", "enabled": "true"}])
             fake_yaml = types.SimpleNamespace(safe_load=lambda stream: config if Path(stream.name).name == "config.yaml" else {"references": [{"class_id": 2, "image_path": "ref.jpg"}]})
             cv2 = FakeCv2({root / "ref.jpg": np.ones((5, 5, 3), np.uint8)})
-            with mock.patch.dict(sys.modules, {"yaml": fake_yaml}), mock.patch.object(app, "_load_cv2", return_value=cv2), mock.patch.object(app, "load_yoloe", side_effect=AssertionError("must not load")):
+            with mock.patch.dict(sys.modules, {"yaml": fake_yaml}), mock.patch.object(app, "_load_cv2", return_value=cv2), mock.patch.object(app, "load_text_localizer", side_effect=AssertionError("must not load")):
                 result = app.main(["--config", str(config_path), "--validate-only", "--require-enabled-count", "1"])
             self.assertEqual(result, 0)
             self.assertFalse((root / "output").exists())
@@ -554,7 +565,7 @@ class CliTests(unittest.TestCase):
             config_path = write_project(root, config)
             cv2 = FakeCv2({root / "ref.jpg": np.ones((5, 5, 3), np.uint8)})
             self.assertEqual(app.load_config(config_path), config)
-            with mock.patch.object(app, "_load_cv2", return_value=cv2), mock.patch.object(app, "load_yoloe", side_effect=AssertionError("must not load")):
+            with mock.patch.object(app, "_load_cv2", return_value=cv2), mock.patch.object(app, "load_text_localizer", side_effect=AssertionError("must not load")):
                 self.assertEqual(app.main(["--config", str(config_path), "--output", "cli-output", "--validate-only"]), 0)
                 self.assertNotEqual(app.main(["--config", str(config_path), "--validate-only"]), 0)
             self.assertFalse((root / "cli-output").exists())
@@ -571,7 +582,7 @@ class CliTests(unittest.TestCase):
             reference.parent.mkdir()
             reference.write_bytes(b"reference-source")
             cv2 = FakeCv2({reference: np.ones((5, 5, 3), np.uint8)})
-            with mock.patch.object(app, "_load_cv2", return_value=cv2), mock.patch.object(app, "load_yoloe", side_effect=AssertionError("must not load")):
+            with mock.patch.object(app, "_load_cv2", return_value=cv2), mock.patch.object(app, "load_text_localizer", side_effect=AssertionError("must not load")):
                 result = app.main(["--config", str(config_path), "--validate-only"])
             self.assertEqual(result, 0)
 
@@ -585,14 +596,14 @@ class CliTests(unittest.TestCase):
             cli_paths = app.prepare_output_paths(root / "cli-output")
             label = cli_paths["labels"] / "shelf.txt"
             label.write_text("sentinel\n", encoding="utf-8")
-            with mock.patch.dict(sys.modules, {"ultralytics.models.yolo.yoloe": predictor_module}), mock.patch.object(app, "_load_cv2", return_value=cv2), mock.patch.object(app, "load_yoloe", return_value=model), mock.patch.object(app, "_ultralytics_version", return_value="test"):
+            with mock.patch.dict(sys.modules, {"ultralytics.models.yolo.yoloe": predictor_module}), mock.patch.object(app, "_load_cv2", return_value=cv2), mock.patch.object(app, "load_text_localizer", return_value=model), mock.patch.object(app, "_ultralytics_version", return_value="test"):
                 skipped = app.main(["--config", str(config_path), "--output", "cli-output"])
                 self.assertEqual(label.read_text(encoding="utf-8"), "sentinel\n")
                 result = app.main(["--config", str(config_path), "--output", "cli-output", "--overwrite"])
             self.assertNotEqual(skipped, 0)
             self.assertEqual(result, 0)
             self.assertEqual(label.read_text(encoding="utf-8"), "")
-            self.assertEqual(model.predict.call_count, 1)
+            self.assertEqual(model.predict.call_count, 2)
             self.assertFalse((root / "output").exists())
             self.assertEqual((root / "images" / "shelf.jpg").read_bytes(), shelf_before)
             self.assertEqual((root / "ref.jpg").read_bytes(), reference_before)
@@ -606,7 +617,7 @@ class CliTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             config_path = write_project(root)
-            with mock.patch.object(app, "load_yoloe", side_effect=AssertionError("must not load")):
+            with mock.patch.object(app, "load_text_localizer", side_effect=AssertionError("must not load")):
                 result = app.main(["--config", str(config_path), "--require-enabled-count", "2"])
             self.assertNotEqual(result, 0)
             self.assertFalse((root / "output").exists())
@@ -617,10 +628,10 @@ class CliTests(unittest.TestCase):
             config_path = write_project(root)
             model, cv2, predictor_module = fake_inference_environment(root)
             real_save_labels = app.save_yolo_labels
-            environment = mock.patch.multiple(app, _load_cv2=mock.DEFAULT, load_yoloe=mock.DEFAULT, _ultralytics_version=mock.DEFAULT)
+            environment = mock.patch.multiple(app, _load_cv2=mock.DEFAULT, load_text_localizer=mock.DEFAULT, _ultralytics_version=mock.DEFAULT)
             with mock.patch.dict(sys.modules, {"ultralytics.models.yolo.yoloe": predictor_module}), environment as patched:
                 patched["_load_cv2"].return_value = cv2
-                patched["load_yoloe"].return_value = model
+                patched["load_text_localizer"].return_value = model
                 patched["_ultralytics_version"].return_value = "test"
                 with mock.patch.object(app, "save_yolo_labels", side_effect=RuntimeError("simulated label failure")):
                     first = app.main(["--config", str(config_path)])
@@ -641,12 +652,15 @@ class CliTests(unittest.TestCase):
             model, cv2, predictor_module = fake_inference_environment(root)
             real_save_labels = app.save_yolo_labels
             raw = root / "output" / "raw_predictions"
-            with mock.patch.dict(sys.modules, {"ultralytics.models.yolo.yoloe": predictor_module}), mock.patch.object(app, "_load_cv2", return_value=cv2), mock.patch.object(app, "load_yoloe", return_value=model), mock.patch.object(app, "_ultralytics_version", return_value="test"):
+            with mock.patch.dict(sys.modules, {"ultralytics.models.yolo.yoloe": predictor_module}), mock.patch.object(app, "_load_cv2", return_value=cv2), mock.patch.object(app, "load_text_localizer", return_value=model), mock.patch.object(app, "_ultralytics_version", return_value="test"):
                 self.assertEqual(app.main(["--config", str(config_path)]), 0)
                 label = raw / "labels" / "shelf.txt"
                 self.assertTrue(label.exists())
                 stale_label = raw / "labels" / "unselected-stale.txt"
                 stale_label.write_text("unrelated\n", encoding="utf-8")
+                retained_metadata = json.loads((raw / "metadata/shelf.json").read_text())
+                retained_metadata["image_path"] = str(root / "images/unselected-stale.jpg")
+                (raw / "metadata/unselected-stale.json").write_text(json.dumps(retained_metadata))
                 with mock.patch.object(app, "save_yolo_labels", side_effect=RuntimeError("simulated overwrite label failure")):
                     self.assertEqual(app.main(["--config", str(config_path), "--overwrite"]), 1)
                 self.assertFalse(label.exists())
@@ -654,7 +668,7 @@ class CliTests(unittest.TestCase):
                 with mock.patch.object(app, "save_yolo_labels", wraps=real_save_labels):
                     self.assertEqual(app.main(["--config", str(config_path)]), 0)
             self.assertTrue(label.exists())
-            self.assertEqual(model.predict.call_count, 3)
+            self.assertEqual(model.predict.call_count, 6)
 
     def test_marker_invalidation_unlinks_selected_symlink_entry_without_resolving_target(self):
         with tempfile.TemporaryDirectory() as td:
@@ -690,21 +704,21 @@ class CliTests(unittest.TestCase):
             self.assertEqual(stale.read_text(encoding="utf-8"), "stale")
             self.assertEqual(reference.read_bytes(), b"reference-target")
 
-    def test_same_provenance_resume_preserves_existing_canvas(self):
+    def test_same_provenance_resume_preserves_existing_label(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             config_path = write_project(root)
             model, cv2, predictor_module = fake_inference_environment(root)
-            with mock.patch.dict(sys.modules, {"ultralytics.models.yolo.yoloe": predictor_module}), mock.patch.object(app, "_load_cv2", return_value=cv2), mock.patch.object(app, "load_yoloe", return_value=model), mock.patch.object(app, "_ultralytics_version", return_value="test"):
+            with mock.patch.dict(sys.modules, {"ultralytics.models.yolo.yoloe": predictor_module}), mock.patch.object(app, "_load_cv2", return_value=cv2), mock.patch.object(app, "load_text_localizer", return_value=model), mock.patch.object(app, "_ultralytics_version", return_value="test"):
                 self.assertEqual(app.main(["--config", str(config_path)]), 0)
                 raw = root / "output" / "raw_predictions"
                 provenance = raw / "provenance.json"
-                canvas = raw / "prompt_canvases" / "batch_000.png"
+                canvas = raw / "labels" / "shelf.txt"
                 self.assertTrue(provenance.exists())
                 canvas.write_bytes(b"preserve-existing-canvas")
                 self.assertEqual(app.main(["--config", str(config_path)]), 0)
             self.assertEqual(canvas.read_bytes(), b"preserve-existing-canvas")
-            self.assertEqual(model.predict.call_count, 1)
+            self.assertEqual(model.predict.call_count, 3)
 
     def test_provenance_change_rejects_reference_or_config_before_mutation(self):
         for change in ("reference", "config"):
@@ -712,9 +726,9 @@ class CliTests(unittest.TestCase):
                 root = Path(td)
                 config_path = write_project(root)
                 model, cv2, predictor_module = fake_inference_environment(root)
-                with mock.patch.dict(sys.modules, {"ultralytics.models.yolo.yoloe": predictor_module}), mock.patch.object(app, "_load_cv2", return_value=cv2), mock.patch.object(app, "load_yoloe", return_value=model), mock.patch.object(app, "_ultralytics_version", return_value="test"):
+                with mock.patch.dict(sys.modules, {"ultralytics.models.yolo.yoloe": predictor_module}), mock.patch.object(app, "_load_cv2", return_value=cv2), mock.patch.object(app, "load_text_localizer", return_value=model), mock.patch.object(app, "_ultralytics_version", return_value="test"):
                     self.assertEqual(app.main(["--config", str(config_path)]), 0)
-                    canvas = root / "output" / "raw_predictions" / "prompt_canvases" / "batch_000.png"
+                    canvas = root / "output" / "raw_predictions" / "labels" / "shelf.txt"
                     canvas.write_bytes(b"old-provenance-canvas")
                     if change == "reference":
                         (root / "ref.jpg").write_bytes(b"changed-reference-content")
@@ -723,7 +737,7 @@ class CliTests(unittest.TestCase):
                         config_path.write_text(json.dumps(config), encoding="utf-8")
                     self.assertNotEqual(app.main(["--config", str(config_path)]), 0)
                 self.assertEqual(canvas.read_bytes(), b"old-provenance-canvas")
-                self.assertEqual(model.predict.call_count, 1)
+                self.assertEqual(model.predict.call_count, 2)
 
     def test_changed_provenance_rejects_new_image_subset_and_preserves_unselected_artifacts(self):
         for overwrite_args in ([], ["--overwrite"]):
@@ -731,11 +745,11 @@ class CliTests(unittest.TestCase):
                 root = Path(td)
                 config_path = write_project(root)
                 model, cv2, predictor_module = fake_inference_environment(root)
-                with mock.patch.dict(sys.modules, {"ultralytics.models.yolo.yoloe": predictor_module}), mock.patch.object(app, "_load_cv2", return_value=cv2), mock.patch.object(app, "load_yoloe", return_value=model), mock.patch.object(app, "_ultralytics_version", return_value="test"):
+                with mock.patch.dict(sys.modules, {"ultralytics.models.yolo.yoloe": predictor_module}), mock.patch.object(app, "_load_cv2", return_value=cv2), mock.patch.object(app, "load_text_localizer", return_value=model), mock.patch.object(app, "_ultralytics_version", return_value="test"):
                     self.assertEqual(app.main(["--config", str(config_path)]), 0)
                     raw = root / "output" / "raw_predictions"
                     old_label = raw / "labels" / "shelf.txt"
-                    canvas = raw / "prompt_canvases" / "batch_000.png"
+                    canvas = raw / "labels" / "shelf.txt"
                     run_json = raw / "run.json"
                     before = (old_label.read_bytes(), canvas.read_bytes(), run_json.read_bytes())
 
@@ -750,7 +764,7 @@ class CliTests(unittest.TestCase):
 
                 self.assertEqual((old_label.read_bytes(), canvas.read_bytes(), run_json.read_bytes()), before)
                 self.assertFalse((raw / "labels" / "new.txt").exists())
-                self.assertEqual(model.predict.call_count, 1)
+                self.assertEqual(model.predict.call_count, 2)
 
     def test_input_output_alias_is_rejected_before_model_load_or_mutation(self):
         with tempfile.TemporaryDirectory() as td:
@@ -768,7 +782,7 @@ class CliTests(unittest.TestCase):
             before = shelf.read_bytes()
             model, cv2, predictor_module = fake_inference_environment(root)
             cv2.images[str(shelf)] = np.zeros((20, 30, 3), np.uint8)
-            with mock.patch.dict(sys.modules, {"ultralytics.models.yolo.yoloe": predictor_module}), mock.patch.object(app, "_load_cv2", return_value=cv2), mock.patch.object(app, "load_yoloe", return_value=model) as loader:
+            with mock.patch.dict(sys.modules, {"ultralytics.models.yolo.yoloe": predictor_module}), mock.patch.object(app, "_load_cv2", return_value=cv2), mock.patch.object(app, "load_text_localizer", return_value=model) as loader:
                 result = app.main(["--config", str(config_path)])
             self.assertNotEqual(result, 0)
             loader.assert_not_called()
@@ -784,13 +798,237 @@ class CliTests(unittest.TestCase):
                     config = valid_config(yoloe={"model": model_value})
                     config_path = write_project(run_root, config)
                     model, cv2, predictor_module = fake_inference_environment(run_root)
-                    with mock.patch.dict(sys.modules, {"ultralytics.models.yolo.yoloe": predictor_module}), mock.patch.object(app, "_load_cv2", return_value=cv2), mock.patch.object(app, "load_yoloe", return_value=model) as loader, mock.patch.object(app, "_ultralytics_version", return_value="test"):
+                    with mock.patch.dict(sys.modules, {"ultralytics.models.yolo.yoloe": predictor_module}), mock.patch.object(app, "_load_cv2", return_value=cv2), mock.patch.object(app, "load_text_localizer", return_value=model) as loader, mock.patch.object(app, "_ultralytics_version", return_value="test"):
                         self.assertEqual(app.main(["--config", str(config_path)]), 0)
                     if model_value == "yoloe-26l-seg.pt":
                         wanted = model_value
                     else:
                         wanted = str((run_root / model_value).resolve())
-                    loader.assert_called_once_with(wanted)
+                    loader.assert_called_once_with(wanted, tuple(config["localization"]["prompts"]))
+
+
+def write_box_first_project(tmp_path, image_count=1):
+    root = tmp_path / "project"
+    root.mkdir()
+    config_path = write_project(root, valid_config(pilot={"max_images": image_count, "max_skus": 2}))
+    rows, refs = [], []
+    for class_id, name in enumerate(("Dove Blue 450 ml", "Sunsilk Pink 450 ml")):
+        rows.append({"class_id": class_id, "barcode": str(111 + class_id), "brand": "Brand", "sku_name": name, "sku_name_th": f"Thai {class_id}", "enabled": "true"})
+        reference = f"ref_{class_id}.jpg"
+        (root / reference).write_bytes(f"reference-{class_id}".encode())
+        refs.append({"class_id": class_id, "image": reference})
+    ManifestTests().write_manifest(root, rows)
+    (root / "refs.yaml").write_text(json.dumps({"references": refs}))
+    (root / "images" / "shelf.jpg").unlink()
+    for index in range(image_count):
+        (root / "images" / f"shelf_{index}.jpg").write_bytes(f"shelf-{index}".encode())
+    return root, config_path
+
+
+class ColorEmbeddingBackend:
+    def __init__(self, *args):
+        pass
+
+    def encode_images(self, images):
+        vectors = {10: [1., 0.], 20: [0., 1.], 30: [-1., 0.]}
+        return np.asarray([vectors.get(int(image[0, 0, 0]), [1., 0.]) for image in images])
+
+    def encode_texts(self, texts):
+        return np.asarray([[0., 1.] if "Sunsilk" in text else [1., 0.] for text in texts])
+
+
+@contextmanager
+def box_first_environment(root, shelf_color=20, empty=False):
+    decoded = {root / f"ref_{index}.jpg": np.full((80, 60, 3), 10 + index * 10, np.uint8) for index in range(2)}
+    decoded.update({path: np.full((100, 100, 3), shelf_color, np.uint8) for path in (root / "images").glob("*.jpg")})
+    cv2 = FakeCv2(decoded)
+    calls = []
+
+    class Localizer:
+        def predict(self, **kwargs):
+            image = kwargs["source"]
+            calls.append(tuple(image.shape[:2]))
+            boxes = types.SimpleNamespace(xyxy=np.empty((0, 4)) if empty else np.array([[10, 10, 30, 50]]), conf=np.array([] if empty else [.8]), cls=np.array([] if empty else [0]))
+            return [types.SimpleNamespace(boxes=boxes, masks=None)]
+
+    with mock.patch.object(app, "_load_cv2", return_value=cv2), mock.patch.object(app, "load_text_localizer", return_value=Localizer()), mock.patch.object(app, "OpenClipBackend", ColorEmbeddingBackend):
+        yield cv2, calls
+
+
+def test_cli_runs_localization_then_matching_for_all_enabled_skus(tmp_path):
+    root, config_path = write_box_first_project(tmp_path)
+    with box_first_environment(root) as (cv2, calls):
+        assert app.main(["--config", str(config_path), "--require-enabled-count", "2"]) == 0
+    raw = root / "output/raw_predictions"
+    assert (raw / "labels/shelf_0.txt").read_text() == "1 0.200000 0.300000 0.200000 0.400000\n"
+    assert calls == [(80, 60), (80, 60), (100, 100)]
+    assert cv2.texts == ["Sunsilk Pink 450 ml 1.00"]
+    metadata = json.loads((raw / "metadata/shelf_0.json").read_text())
+    assert (metadata["image_width"], metadata["image_height"]) == (100, 100)
+    assert metadata["predictions"][0]["assigned_class_id"] == 1
+    assert metadata["predictions"][0]["rankings"][0]["visual_similarity"] == 1.
+    assert metadata["candidate_count"] == metadata["assigned_permanent_count"] == 1
+    assert metadata["needs_review_count"] == 0
+    assert metadata["image_status"] == "processed"
+    diagnostics = json.loads((raw / "reference_diagnostics.json").read_text())
+    assert [row["class_id"] for row in diagnostics] == [0, 1]
+    run = json.loads((raw / "run.json").read_text())
+    assert run["totals"]["candidate_count"] == 1
+    assert run["score_summaries"]["top1"] == {"count": 1, "minimum": 1., "p25": 1., "median": 1., "p75": 1., "maximum": 1.}
+    assert not (raw / "prompt_canvases").exists()
+
+
+def test_uncertain_preview_and_review_queue_use_english_suggestion(tmp_path):
+    root, config_path = write_box_first_project(tmp_path)
+    with box_first_environment(root, shelf_color=30) as (cv2, _):
+        assert app.main(["--config", str(config_path)]) == 0
+    raw = root / "output/raw_predictions"
+    assert (raw / "labels/shelf_0.txt").read_text().startswith("89 ")
+    with (raw / "review_queue.csv").open() as handle:
+        rows = list(csv.DictReader(handle))
+    assert len(rows) == 1
+    assert rows[0]["assigned_class_id"] == "89"
+    assert rows[0]["assigned_barcode"] == rows[0]["assigned_name_th"] == ""
+    assert rows[0]["top1_name"] == "Sunsilk Pink 450 ml"
+    assert rows[0]["top3_class_id"] == ""
+    assert rows[0]["review_reason"] == "score_below_threshold"
+    assert cv2.texts == ["Needs Review | Sunsilk Pink 450 ml"]
+
+
+def test_box_first_resume_preserves_queue_and_aggregate_metadata(tmp_path):
+    root, config_path = write_box_first_project(tmp_path)
+    with box_first_environment(root):
+        assert app.main(["--config", str(config_path)]) == 0
+    raw = root / "output/raw_predictions"
+    before = (raw / "review_queue.csv").read_bytes()
+    with box_first_environment(root) as (_, calls):
+        assert app.main(["--config", str(config_path)]) == 0
+    assert (raw / "review_queue.csv").read_bytes() == before
+    assert (100, 100) not in calls
+    run = json.loads((raw / "run.json").read_text())
+    assert run["counters"]["skipped"] == 1
+    assert run["totals"]["assigned_permanent_count"] == 1
+    with box_first_environment(root, shelf_color=30):
+        assert app.main(["--config", str(config_path), "--overwrite"]) == 0
+    with (raw / "review_queue.csv").open() as handle:
+        rows = list(csv.DictReader(handle))
+    assert len(rows) == 1 and rows[0]["assigned_class_id"] == "89"
+
+
+def test_no_candidates_is_review_status_with_null_score_statistics(tmp_path):
+    root, config_path = write_box_first_project(tmp_path)
+    with box_first_environment(root, empty=True):
+        assert app.main(["--config", str(config_path)]) == 0
+    raw = root / "output/raw_predictions"
+    assert (raw / "labels/shelf_0.txt").read_text() == ""
+    metadata = json.loads((raw / "metadata/shelf_0.json").read_text())
+    assert metadata["image_status"] == "no_candidates_needs_review"
+    run = json.loads((raw / "run.json").read_text())
+    assert run["score_summaries"]["top1"] == {"count": 0, "minimum": None, "p25": None, "median": None, "p75": None, "maximum": None}
+
+
+def test_box_first_shelf_error_is_not_completed_and_other_images_continue(tmp_path):
+    root, config_path = write_box_first_project(tmp_path, image_count=2)
+    with box_first_environment(root) as (cv2, _):
+        cv2.images.pop(str(root / "images/shelf_0.jpg"))
+        assert app.main(["--config", str(config_path)]) == 1
+    raw = root / "output/raw_predictions"
+    assert not (raw / "labels/shelf_0.txt").exists()
+    assert (raw / "labels/shelf_1.txt").exists()
+    run = json.loads((raw / "run.json").read_text())
+    assert run["images"]["shelf_0.jpg"]["image_status"] == "error"
+
+
+def test_runtime_manifest_rejects_missing_thai_name(tmp_path):
+    for value in ("", "   "):
+        path = ManifestTests().write_manifest(tmp_path, [{"class_id": 1, "barcode": "1", "brand": "B", "sku_name": "Name", "sku_name_th": value, "enabled": "true"}])
+        with np.testing.assert_raises(ValueError):
+            app.load_sku_manifest(path)
+
+
+def test_geometry_rejections_and_duplicates_are_reported(tmp_path):
+    root, config_path = write_box_first_project(tmp_path)
+    class ShelfModel:
+        def predict(self, **kwargs):
+            boxes = types.SimpleNamespace(xyxy=np.array([[10, 10, 30, 50], [10, 10, 30, 50], [0, 0, 100, 100], [1, 1, 2, 2]]), conf=np.array([.8, .7, .9, .6]), cls=np.array([0, 0, 0, 0]))
+            return [types.SimpleNamespace(boxes=boxes, masks=None)]
+    with box_first_environment(root), mock.patch.object(app, "load_text_localizer", return_value=ShelfModel()):
+        assert app.main(["--config", str(config_path)]) == 0
+    raw = root / "output/raw_predictions"
+    metadata = json.loads((raw / "metadata/shelf_0.json").read_text())
+    assert metadata["geometry_rejections"]["too_small"] == 1
+    assert metadata["geometry_rejections"]["too_large"] == 1
+    assert metadata["duplicates_removed"] == 1
+    run = json.loads((raw / "run.json").read_text())
+    assert run["totals"]["geometry_rejections"]["too_small"] == 1
+    assert run["totals"]["geometry_rejections"]["too_large"] == 1
+
+
+def test_runtime_weight_changes_refuse_resume_before_output_changes(tmp_path):
+    root, config_path = write_box_first_project(tmp_path)
+    class WeightedBackend(ColorEmbeddingBackend):
+        weight = 1.
+        def __init__(self, *args):
+            self._model = types.SimpleNamespace(state_dict=lambda: {"weight": np.array([self.weight])})
+    with box_first_environment(root), mock.patch.object(app, "OpenClipBackend", WeightedBackend):
+        assert app.main(["--config", str(config_path)]) == 0
+        raw = root / "output/raw_predictions"
+        before = {str(path): path.read_bytes() for path in raw.rglob("*") if path.is_file()}
+        WeightedBackend.weight = 2.
+        assert app.main(["--config", str(config_path)]) == 2
+        assert {str(path): path.read_bytes() for path in raw.rglob("*") if path.is_file()} == before
+
+
+def test_validate_only_imports_no_model_packages_and_rejects_reserved_class(tmp_path):
+    import builtins
+    root, config_path = write_box_first_project(tmp_path)
+    original_import = builtins.__import__
+    def guarded_import(name, *args, **kwargs):
+        if name.split(".")[0] in {"ultralytics", "open_clip", "torch"}:
+            raise AssertionError(f"validate-only imported {name}")
+        return original_import(name, *args, **kwargs)
+    with box_first_environment(root), mock.patch("builtins.__import__", guarded_import):
+        assert app.main(["--config", str(config_path), "--validate-only"]) == 0
+        assert not (root / "output").exists()
+        ManifestTests().write_manifest(root, [{"class_id": 89, "barcode": "89", "brand": "B", "sku_name": "Name", "enabled": "true"}])
+        (root / "refs.yaml").write_text(json.dumps({"references": [{"class_id": 89, "image": "ref_0.jpg"}]}))
+        assert app.main(["--config", str(config_path), "--validate-only"]) == 2
+        assert not (root / "output").exists()
+
+
+def test_local_checkpoint_and_stage_settings_changes_refuse_resume(tmp_path):
+    root, config_path = write_box_first_project(tmp_path)
+    config = json.loads(config_path.read_text())
+    config["yoloe"]["model"] = "localizer.pt"
+    config["matching"]["pretrained"] = "clip.pt"
+    config_path.write_text(json.dumps(config))
+    (root / "localizer.pt").write_bytes(b"localizer-1")
+    (root / "clip.pt").write_bytes(b"clip-1")
+    with box_first_environment(root):
+        assert app.main(["--config", str(config_path)]) == 0
+        raw = root / "output/raw_predictions"
+        before = (raw / "run.json").read_bytes()
+        for checkpoint in (root / "clip.pt", root / "localizer.pt"):
+            original = checkpoint.read_bytes()
+            checkpoint.write_bytes(b"changed")
+            assert app.main(["--config", str(config_path)]) == 2
+            assert (raw / "run.json").read_bytes() == before
+            checkpoint.write_bytes(original)
+        for section, key, value in (("localization", "prompts", ["different prompt"]), ("localization", "tile_size", 512), ("matching", "min_score", .4), ("matching", "model", "other-model")):
+            changed = json.loads(json.dumps(config))
+            changed[section][key] = value
+            config_path.write_text(json.dumps(changed))
+            assert app.main(["--config", str(config_path)]) == 2
+            assert (raw / "run.json").read_bytes() == before
+        config_path.write_text(json.dumps(config))
+
+
+def test_unrecognized_assignment_cannot_produce_label(tmp_path):
+    root, config_path = write_box_first_project(tmp_path)
+    invalid = ClassifiedCandidate(Candidate((10, 10, 30, 50), .8, "shampoo bottle", 0, False), 90, "Invalid", True, "accepted", (RankedSku(90, "90", "Invalid", .8, .8, .8),))
+    with box_first_environment(root), mock.patch.object(app, "classify_runtime_candidates", return_value=[invalid]):
+        assert app.main(["--config", str(config_path)]) == 1
+    assert not (root / "output/raw_predictions/labels/shelf_0.txt").exists()
 
 
 if __name__ == "__main__":

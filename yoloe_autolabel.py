@@ -17,14 +17,17 @@ import subprocess
 import sys
 import tempfile
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 import numpy as np
 
-from hair_annotation.config import BoxFirstConfig
+from hair_annotation.config import BoxFirstConfig, LocalizationConfig, MatchingConfig
+from hair_annotation.localization import load_text_localizer, localize_image, localize_reference_image
+from hair_annotation.matching import OpenClipBackend, PrototypeBank, build_prototypes, classify_candidates, derive_reference_views
+from hair_annotation.types import Candidate, ClassifiedCandidate
 
 
 @dataclass(frozen=True)
@@ -34,6 +37,7 @@ class Sku:
     brand: str
     sku_name: str
     enabled: bool
+    sku_name_th: str = ""
 
 
 @dataclass(frozen=True)
@@ -74,7 +78,7 @@ _REQUIRED_SECTIONS = (
     "output",
     "pilot",
 )
-_MANIFEST_COLUMNS = ("class_id", "barcode", "brand", "sku_name", "enabled")
+_MANIFEST_COLUMNS = ("class_id", "barcode", "brand", "sku_name", "enabled", "sku_name_th")
 _OFFICIAL_YOLOE_ALIASES = frozenset(
     f"yoloe-{family}{size}-seg.pt"
     for family in ("v8", "11", "26")
@@ -269,6 +273,8 @@ def load_sku_manifest(path: Path) -> dict[int, Sku]:
                 enabled_text = (row.get("enabled") or "").strip().casefold()
                 if enabled_text not in {"true", "false"}:
                     raise ValueError(f"Invalid enabled value on line {line_number}: {enabled_text!r}")
+                if not (row.get("sku_name_th") or "").strip():
+                    raise ValueError(f"Blank sku_name_th on line {line_number}")
                 items.append(
                     Sku(
                         class_id=class_id,
@@ -276,6 +282,7 @@ def load_sku_manifest(path: Path) -> dict[int, Sku]:
                         brand=(row.get("brand") or "").strip(),
                         sku_name=(row.get("sku_name") or "").strip(),
                         enabled=enabled_text == "true",
+                        sku_name_th=(row.get("sku_name_th") or "").strip(),
                     )
                 )
     except OSError as exc:
@@ -659,6 +666,8 @@ def _output_layout(output_root: Path) -> dict[str, Path]:
         "summary_csv": raw / "summary.csv",
         "run_json": raw / "run.json",
         "provenance_json": raw / "provenance.json",
+        "review_queue_csv": raw / "review_queue.csv",
+        "reference_diagnostics_json": raw / "reference_diagnostics.json",
     }
     for key, path in paths.items():
         if key == "root":
@@ -677,9 +686,9 @@ def _output_layout(output_root: Path) -> dict[str, Path]:
 def prepare_output_paths(output_root: Path) -> dict[str, Path]:
     paths = _output_layout(output_root)
     # Validate every destination before the first filesystem mutation.
-    for key in ("labels", "metadata", "previews", "prompt_canvases", "summary_csv", "run_json", "provenance_json"):
+    for key in ("labels", "metadata", "previews", "prompt_canvases", "summary_csv", "run_json", "provenance_json", "review_queue_csv", "reference_diagnostics_json"):
         _assert_raw_destination(paths[key])
-    for key in ("labels", "metadata", "previews", "prompt_canvases"):
+    for key in ("labels", "metadata", "previews"):
         paths[key].mkdir(parents=True, exist_ok=True)
     return paths
 
@@ -774,7 +783,7 @@ def save_metadata(
     _atomic_write_text(Path(path), json.dumps(payload, indent=2, sort_keys=True) + "\n", overwrite)
 
 
-def save_preview(path: Path, image: np.ndarray, predictions: Sequence[Prediction], overwrite: bool) -> None:
+def save_preview(path: Path, image: np.ndarray, predictions: Sequence[Prediction | ClassifiedCandidate], overwrite: bool) -> None:
     destination = _assert_raw_destination(path)
     if destination.exists() and not overwrite:
         raise FileExistsError(f"Output already exists: {destination}")
@@ -783,14 +792,22 @@ def save_preview(path: Path, image: np.ndarray, predictions: Sequence[Prediction
     cv2 = _load_cv2()
     preview = image.copy()
     height, width = preview.shape[:2]
-    for prediction in sorted(predictions, key=lambda p: (p.dataset_class_id, -p.confidence)):
-        x1, y1, x2, y2 = prediction.xyxy
+    for prediction in predictions:
+        if isinstance(prediction, ClassifiedCandidate):
+            x1, y1, x2, y2 = prediction.candidate.xyxy
+            if prediction.accepted:
+                label = f"{prediction.assigned_name} {prediction.rankings[0].score:.2f}"
+            else:
+                suggestion = prediction.rankings[0].sku_name if prediction.rankings else "no suggestion"
+                label = f"Needs Review | {suggestion}"
+        else:
+            x1, y1, x2, y2 = prediction.xyxy
+            label = f"{prediction.dataset_class_id} {prediction.sku_name} {prediction.confidence:.2f}"
         left = int(min(max(x1, 0), width - 1))
         top = int(min(max(y1, 0), height - 1))
         right = int(min(max(x2, 0), width - 1))
         bottom = int(min(max(y2, 0), height - 1))
         cv2.rectangle(preview, (left, top), (right, bottom), (0, 255, 0), 2)
-        label = f"{prediction.dataset_class_id} {prediction.sku_name} {prediction.confidence:.2f}"
         cv2.putText(preview, label, (left, max(12, top - 4)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1, cv2.LINE_AA)
     _atomic_write_image(destination, preview, cv2, overwrite)
 
@@ -889,17 +906,10 @@ def _build_provenance(
     settings: Mapping[str, Any],
     active_skus: Sequence[Sku],
     references: Sequence[ReferencePrompt],
+    pipeline: BoxFirstConfig,
 ) -> dict[str, Any]:
     ordered_skus = sorted(active_skus, key=lambda item: item.class_id)
     active_ids = {item.class_id for item in ordered_skus}
-    batch_size = _positive_integer(settings["prompt_batch_size"], "yoloe.prompt_batch_size")
-    mappings = [
-        {
-            str(temporary_id): item.class_id
-            for temporary_id, item in enumerate(ordered_skus[offset : offset + batch_size])
-        }
-        for offset in range(0, len(ordered_skus), batch_size)
-    ]
     reference_records = [
         {
             "class_id": prompt.class_id,
@@ -911,14 +921,16 @@ def _build_provenance(
         if prompt.class_id in active_ids
     ]
     material = {
-        "schema_version": 1,
+        "schema_version": 2,
         "model": model_path,
-        "settings": {
-            key: _json_ready(settings[key])
-            for key in ("imgsz", "conf", "iou", "device", "prompt_batch_size", "canvas_cell_size", "canvas_padding")
-        },
+        "model_sha256": _file_sha256(Path(model_path)) if Path(model_path).is_file() else None,
+        "matching_checkpoint_sha256": _file_sha256(Path(pipeline.matching.pretrained)) if Path(pipeline.matching.pretrained).is_file() else None,
+        "settings": _json_ready(settings),
+        "localization": asdict(pipeline.localization),
+        "matching": asdict(pipeline.matching),
+        "dependencies": _dependency_versions(),
         "active_class_ids": [item.class_id for item in ordered_skus],
-        "batch_mappings": mappings,
+        "active_skus": [asdict(item) for item in ordered_skus],
         "references": reference_records,
     }
     canonical = json.dumps(material, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
@@ -1038,24 +1050,152 @@ def _validate_input_output_separation(
 
 def _validate_references_for_active(
     references: Sequence[ReferencePrompt], active_skus: Sequence[Sku], skus: Mapping[int, Sku]
-) -> None:
+) -> dict[Path, np.ndarray]:
     cv2 = _load_cv2()
     active_ids = {item.class_id for item in active_skus}
     seen: set[int] = set()
+    decoded: dict[Path, np.ndarray] = {}
     for prompt in references:
         if prompt.class_id not in active_ids:
             continue
         _assert_input_allowed(prompt.image_path)
         if not prompt.image_path.is_file():
             raise ValueError(f"Reference image is missing: {prompt.image_path}")
-        image = cv2.imread(str(prompt.image_path))
+        image = decoded.get(prompt.image_path)
+        if image is None:
+            image = cv2.imread(str(prompt.image_path))
         if image is None:
             raise ValueError(f"Reference image cannot be decoded: {prompt.image_path}")
         validate_reference(prompt, image, skus)
+        decoded[prompt.image_path] = image
         seen.add(prompt.class_id)
     missing = sorted(active_ids - seen)
     if missing:
         raise ValueError(f"Missing valid references for enabled class IDs: {missing}")
+    return decoded
+
+
+def _dependency_versions() -> dict[str, str | None]:
+    # Reading distribution metadata never imports either model implementation.
+    from importlib.metadata import PackageNotFoundError, version
+
+    versions = {}
+    for package in ("ultralytics", "open_clip_torch", "torch", "numpy", "opencv-python", "Pillow"):
+        try:
+            versions[package] = version(package)
+        except PackageNotFoundError:
+            versions[package] = None
+    return versions
+
+
+def build_runtime_matcher(
+    active_skus: Sequence[Sku],
+    references: Sequence[ReferencePrompt],
+    decoded_references: Mapping[Path, np.ndarray],
+    localizer: Any,
+    localization_config: LocalizationConfig,
+    matching_config: MatchingConfig,
+    imgsz: int,
+    device: int | str,
+) -> tuple[OpenClipBackend, PrototypeBank, list[dict[str, Any]]]:
+    views: dict[int, list[np.ndarray]] = {sku.class_id: [] for sku in active_skus}
+    diagnostics: list[dict[str, Any]] = []
+    for reference in references:
+        if reference.class_id not in views:
+            continue
+        image = decoded_references[reference.image_path]
+        candidates, localization = localize_reference_image(localizer, image, localization_config, imgsz, device)
+        derived, records = derive_reference_views(
+            {reference.class_id: image}, {reference.class_id: candidates}, matching_config.max_reference_views
+        )
+        views[reference.class_id].extend(derived[reference.class_id])
+        diagnostics.append({**records[0], "image_path": str(reference.image_path), "localization": localization})
+    backend = OpenClipBackend(matching_config.model, matching_config.pretrained, device)
+    bank = build_prototypes(backend, [asdict(sku) for sku in active_skus], views, matching_config)
+    return backend, bank, diagnostics
+
+
+def classify_runtime_candidates(
+    backend: OpenClipBackend, image_bgr: np.ndarray, candidates: Sequence[Candidate],
+    bank: PrototypeBank, matching_config: MatchingConfig,
+) -> list[ClassifiedCandidate]:
+    return classify_candidates(backend, image_bgr, candidates, bank, matching_config)
+
+
+_REVIEW_COLUMNS = (
+    "image", "box_index", "x1", "y1", "x2", "y2", "box_width", "box_height",
+    "area_ratio", "aspect_ratio", "tile_index", "localization_confidence", "generic_prompt",
+    "mask_used", "assigned_class_id", "assigned_barcode", "assigned_name", "assigned_name_th",
+    "accepted", "review_reason", "top1_class_id", "top1_barcode", "top1_name", "top1_score",
+    "top2_class_id", "top2_barcode", "top2_name", "top2_score",
+    "top3_class_id", "top3_barcode", "top3_name", "top3_score",
+)
+
+
+def _classified_records(
+    image_path: Path, image: np.ndarray, classified: Sequence[ClassifiedCandidate],
+    skus: Mapping[int, Sku], localization: Mapping[str, Any],
+) -> tuple[list[Prediction], list[dict[str, Any]], dict[str, Any]]:
+    height, width = image.shape[:2]
+    predictions, review_rows, records = [], [], []
+    for index, item in enumerate(classified):
+        class_id = item.assigned_class_id
+        if type(class_id) is not int or (class_id != 89 and class_id not in skus):
+            raise ValueError(f"Assigned class {class_id} is absent from the active manifest")
+        if item.accepted != (class_id != 89):
+            raise ValueError("Assigned class and acceptance status disagree")
+        assigned = skus.get(class_id)
+        x1, y1, x2, y2 = item.candidate.xyxy
+        # Validate geometry before any image artifact is written.
+        convert_xyxy_to_yolo(item.candidate.xyxy, width, height)
+        x1, x2 = max(0., min(float(width), x1)), max(0., min(float(width), x2))
+        y1, y2 = max(0., min(float(height), y1)), max(0., min(float(height), y2))
+        box_width, box_height = x2 - x1, y2 - y1
+        row = {
+            "image": image_path.name, "box_index": index, "x1": x1, "y1": y1, "x2": x2, "y2": y2,
+            "box_width": box_width, "box_height": box_height,
+            "area_ratio": box_width * box_height / (width * height), "aspect_ratio": box_width / box_height,
+            "tile_index": item.candidate.tile_index, "localization_confidence": item.candidate.localization_confidence,
+            "generic_prompt": item.candidate.prompt_name, "mask_used": item.candidate.mask_used,
+            "assigned_class_id": class_id, "assigned_barcode": assigned.barcode if assigned else "",
+            "assigned_name": assigned.sku_name if assigned else "Needs Review",
+            "assigned_name_th": assigned.sku_name_th if assigned else "",
+            "accepted": item.accepted, "review_reason": item.review_reason,
+        }
+        for rank_index, rank in enumerate(item.rankings[:3], 1):
+            row.update({f"top{rank_index}_class_id": rank.class_id, f"top{rank_index}_barcode": rank.barcode,
+                        f"top{rank_index}_name": rank.sku_name, f"top{rank_index}_score": rank.score})
+        review_rows.append(row)
+        records.append({**row, "xyxy": [x1, y1, x2, y2], "rankings": [asdict(rank) for rank in item.rankings[:3]]})
+        predictions.append(Prediction(class_id, 0, row["assigned_barcode"], row["assigned_name"],
+                                      item.rankings[0].score if item.rankings else 0., (x1, y1, x2, y2), 0))
+    rejected = {key: value for key, value in localization.items() if key.startswith("rejected_")}
+    metadata = {
+        "image_path": str(image_path), "image_width": width, "image_height": height,
+        "localization": dict(localization), "predictions": records,
+        "candidate_count": len(classified), "geometry_rejections": rejected,
+        "duplicates_removed": localization.get("duplicates_removed", 0),
+        "assigned_permanent_count": sum(item.accepted for item in classified),
+        "needs_review_count": sum(not item.accepted for item in classified),
+        "image_status": "processed" if classified else "no_candidates_needs_review",
+    }
+    return predictions, review_rows, metadata
+
+
+def _save_review_queue(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
+    from io import StringIO
+
+    buffer = StringIO(newline="")
+    writer = csv.DictWriter(buffer, fieldnames=_REVIEW_COLUMNS, lineterminator="\n")
+    writer.writeheader()
+    writer.writerows(sorted(rows, key=lambda row: (str(row["image"]).casefold(), str(row["image"]), int(row["box_index"]))))
+    _atomic_write_text(path, buffer.getvalue(), True)
+
+
+def _score_summary(scores: Sequence[float]) -> dict[str, int | float | None]:
+    names = ("minimum", "p25", "median", "p75", "maximum")
+    values = np.percentile(scores, [0, 25, 50, 75, 100]).tolist() if scores else [None] * 5
+    return {"count": len(scores), **dict(zip(names, values))}
 
 
 def _git_info(config_path: Path) -> dict[str, str | None]:
@@ -1087,6 +1227,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         config_path = _assert_input_allowed(Path(args.config))
         config = load_config(config_path)
+        pipeline = BoxFirstConfig.from_mapping(config)
         dataset = config["dataset"]
         yoloe_settings = config["yoloe"]
         output_settings = config["output"]
@@ -1108,6 +1249,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         skus = load_sku_manifest(manifest_path)
         references = load_reference_definitions(references_path, skus, config_path.parent)
         active_skus = select_active_skus(skus, pilot)
+        if 89 in skus:
+            raise ValueError("Class 89 is reserved for Needs Review and cannot be a permanent SKU")
         enabled_count = sum(item.enabled for item in skus.values())
         if args.require_enabled_count is not None and enabled_count != args.require_enabled_count:
             raise ValueError(f"Enabled SKU count is {enabled_count}, expected {args.require_enabled_count}")
@@ -1116,9 +1259,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             shelf_images = shelf_images[: _positive_integer(pilot.get("max_images"), "pilot.max_images")]
         configured_model = str(yoloe_settings.get("model", yoloe_settings.get("model_path", "")))
         model_path, model_input = _resolve_model_value(config_path, configured_model)
-        batch_count = math.ceil(len(active_skus) / _positive_integer(yoloe_settings["prompt_batch_size"], "yoloe.prompt_batch_size"))
-        planned_outputs = [paths["summary_csv"], paths["run_json"], paths["provenance_json"]]
-        planned_outputs.extend(paths["prompt_canvases"] / f"batch_{index:03d}.png" for index in range(batch_count))
+        pretrained = pipeline.matching.pretrained
+        matching_input = None
+        if Path(pretrained).suffix.casefold() in {".pt", ".pth", ".bin", ".safetensors"} or pretrained.startswith(("/", "./", "../", "~")):
+            matching_input = resolve_config_path(config_path, pretrained)
+            pipeline = replace(pipeline, matching=replace(pipeline.matching, pretrained=str(matching_input)))
+        planned_outputs = [paths[key] for key in ("summary_csv", "run_json", "provenance_json", "review_queue_csv", "reference_diagnostics_json")]
         completion_markers: list[Path] = []
         for image_path in shelf_images:
             completion_markers.append(paths["labels"] / f"{image_path.stem}.txt")
@@ -1131,6 +1277,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         input_files = [config_path, manifest_path, references_path, *[prompt.image_path for prompt in references], *shelf_images]
         if model_input is not None:
             input_files.append(model_input)
+        if matching_input is not None:
+            input_files.append(matching_input)
         _validate_input_output_separation(paths, input_files, [images_root], planned_outputs)
         _validate_completion_markers(
             completion_markers,
@@ -1139,8 +1287,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             input_files,
             overwrite,
         )
-        _validate_references_for_active(references, active_skus, skus)
-        provenance = _build_provenance(model_path, yoloe_settings, active_skus, references)
+        decoded_references = _validate_references_for_active(references, active_skus, skus)
+        provenance = _build_provenance(model_path, yoloe_settings, active_skus, references, pipeline)
         completed_labels = [marker for marker in completion_markers if os.path.lexists(marker)]
         all_label_markers = _all_lexical_label_markers(paths["labels"], paths["raw_predictions"])
         selected_marker_keys = {_lexical_path_key(marker) for marker in completion_markers}
@@ -1163,6 +1311,38 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"Validation successful: {len(active_skus)} SKU(s), {len(shelf_images)} image(s)")
             return 0
 
+        # Load retained review state before invalidating any selected labels.
+        review_rows: list[dict[str, Any]] = []
+        image_records: dict[str, dict[str, Any]] = {}
+        predictions_by_image: dict[Path, Sequence[Prediction]] = {}
+        retained_stems = {marker.stem for marker in retained_labels}
+        if matching_resume:
+            queue_path = _assert_raw_destination(paths["review_queue_csv"])
+            if not queue_path.is_file():
+                raise ValueError("Cannot resume completed labels without review_queue.csv")
+            with queue_path.open(encoding="utf-8", newline="") as handle:
+                reader = csv.DictReader(handle)
+                if tuple(reader.fieldnames or ()) != _REVIEW_COLUMNS:
+                    raise ValueError("Existing review_queue.csv has incompatible columns")
+                review_rows = [row for row in reader if Path(row["image"]).stem in retained_stems]
+            for marker in retained_labels:
+                metadata_path = paths["metadata"] / f"{marker.stem}.json"
+                _validate_input_output_separation(paths, input_files, [images_root], [metadata_path])
+                metadata = json.loads(_assert_raw_destination(metadata_path).read_text(encoding="utf-8"))
+                image_name = Path(metadata["image_path"]).name
+                image_records[image_name] = metadata
+                predictions_by_image[Path(metadata["image_path"])] = [
+                    Prediction(row["assigned_class_id"], 0, row["assigned_barcode"], row["assigned_name"],
+                               row["rankings"][0]["score"] if row["rankings"] else 0., tuple(row["xyxy"]), 0)
+                    for row in metadata["predictions"]
+                ]
+
+        model = load_text_localizer(model_path, pipeline.localization.prompts)
+        backend, bank, reference_diagnostics = build_runtime_matcher(
+            active_skus=active_skus, references=references, decoded_references=decoded_references,
+            localizer=model, localization_config=pipeline.localization, matching_config=pipeline.matching,
+            imgsz=yoloe_settings["imgsz"], device=yoloe_settings["device"],
+        )
         paths = prepare_output_paths(output_root)
         if overwrite:
             _invalidate_labels(completed_labels, paths["labels"], paths["raw_predictions"], input_files)
@@ -1172,20 +1352,18 @@ def main(argv: Sequence[str] | None = None) -> int:
                 json.dumps(provenance, indent=2, sort_keys=True) + "\n",
                 True,
             )
-        batch_settings = dict(yoloe_settings)
-        batch_settings["_reuse_existing_canvases"] = matching_resume
-        batches = build_prompt_batches(references, active_skus, batch_settings, paths["prompt_canvases"])
-        model = load_yoloe(model_path)
-        save_metadata_enabled = bool(output_settings.get("save_metadata", True))
+        _atomic_write_text(paths["reference_diagnostics_json"], json.dumps(_json_ready(reference_diagnostics), indent=2, sort_keys=True) + "\n", True)
+        _save_review_queue(paths["review_queue_csv"], review_rows)
         save_previews_enabled = bool(output_settings.get("save_previews", True))
         run_context = {
             "model": model_path,
-            "ultralytics_version": _ultralytics_version(),
+            "dependencies": provenance["dependencies"],
+            "localization": asdict(pipeline.localization),
+            "matching": asdict(pipeline.matching),
             **{key: yoloe_settings.get(key) for key in ("imgsz", "conf", "iou", "device")},
         }
         counters: dict[str, int | float] = {"processed": 0, "skipped": 0, "errors": 0, "no_detection_images": 0}
         error_details: list[dict[str, str]] = []
-        predictions_by_image: dict[Path, Sequence[Prediction]] = {}
         cv2 = _load_cv2()
         for image_path in shelf_images:
             if should_skip_image(image_path.stem, paths, overwrite):
@@ -1195,19 +1373,30 @@ def main(argv: Sequence[str] | None = None) -> int:
                 image = cv2.imread(str(image_path))
                 if image is None or image.ndim < 2 or image.shape[0] <= 0 or image.shape[1] <= 0:
                     raise ValueError(f"Cannot decode shelf image: {image_path}")
-                predictions = [prediction for batch in batches for prediction in run_yoloe(model, image_path, batch, yoloe_settings, skus)]
+                candidates, localization = localize_image(model, image, pipeline.localization, yoloe_settings["imgsz"], yoloe_settings["device"])
+                classified = classify_runtime_candidates(backend, image, candidates, bank, pipeline.matching)
+                predictions, new_rows, metadata = _classified_records(
+                    image_path, image, classified, {sku.class_id: sku for sku in active_skus}, localization
+                )
                 if not predictions:
                     counters["no_detection_images"] = int(counters["no_detection_images"]) + 1
-                if save_metadata_enabled:
-                    save_metadata(paths["metadata"] / f"{image_path.stem}.json", image_path, predictions, run_context, True)
+                # Per-image metadata is mandatory completion evidence for resume.
+                metadata["run_context"] = run_context
+                _atomic_write_text(paths["metadata"] / f"{image_path.stem}.json", json.dumps(_json_ready(metadata), indent=2, sort_keys=True) + "\n", True)
                 if save_previews_enabled:
-                    save_preview(paths["previews"] / f"{image_path.stem}{image_path.suffix}", image, predictions, True)
+                    save_preview(paths["previews"] / f"{image_path.stem}{image_path.suffix}", image, classified, True)
+                # Persist the queue before the completion label, so an interrupted
+                # run cannot skip a label whose review row was never committed.
+                _save_review_queue(paths["review_queue_csv"], [*review_rows, *new_rows])
                 save_yolo_labels(paths["labels"] / f"{image_path.stem}.txt", predictions, image.shape[1], image.shape[0], overwrite)
+                review_rows.extend(new_rows)
+                image_records[image_path.name] = metadata
                 predictions_by_image[image_path] = predictions
                 counters["processed"] = int(counters["processed"]) + 1
             except Exception as exc:
                 counters["errors"] = int(counters["errors"]) + 1
                 error_details.append({"image_path": str(image_path), "error": str(exc)})
+                image_records[image_path.name] = {"image_status": "error", "error": str(exc)}
                 print(f"ERROR {image_path}: {exc}", file=sys.stderr)
         counters["low_confidence_threshold"] = float(
             output_settings.get(
@@ -1216,6 +1405,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         )
         save_summary(paths["summary_csv"], paths["run_json"], active_skus, predictions_by_image, counters)
+        _save_review_queue(paths["review_queue_csv"], review_rows)
         run_payload = json.loads(paths["run_json"].read_text(encoding="utf-8"))
         run_payload.update(
             {
@@ -1223,15 +1413,18 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "git": _git_info(config_path),
                 "config": _json_ready(config),
-                "batches": [
-                    {
-                        "index": batch.index,
-                        "dataset_class_ids": list(batch.dataset_class_ids),
-                        "prompt_to_dataset_class": batch.prompt_to_dataset_class,
-                        "canvas_path": str(batch.canvas_path),
-                    }
-                    for batch in batches
-                ],
+                "images": image_records,
+                "totals": {
+                    key: sum(record.get(key, 0) for record in image_records.values())
+                    for key in ("candidate_count", "duplicates_removed", "assigned_permanent_count", "needs_review_count")
+                },
+                "score_summaries": {
+                    f"top{rank_index + 1}": _score_summary([
+                        row["rankings"][rank_index]["score"]
+                        for record in image_records.values() for row in record.get("predictions", [])
+                        if len(row["rankings"]) > rank_index
+                    ]) for rank_index in (0, 1)
+                },
                 "settings": _json_ready(run_context),
                 "effective_paths": {
                     "config": str(config_path),
