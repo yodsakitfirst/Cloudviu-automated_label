@@ -54,5 +54,5 @@ output:
 pilot:
   enabled: false
   class_ids: []
-  max_skus: 5
+  max_skus: 89
   max_images: 10

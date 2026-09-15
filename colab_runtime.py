@@ -52,7 +52,7 @@ def _atomic_write_text(path: Path, content: str) -> None:
 
 def write_pilot_config(
     project: Path,
-    max_skus: int = 5,
+    max_skus: int = 89,
     max_images: int = 10,
 ) -> Path:
     """Create a separate pilot config without mutating the full-run config."""

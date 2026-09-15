@@ -1,6 +1,11 @@
 import csv
 import io
+import os
+import shutil
+import subprocess
+import sys
 import zipfile
+from dataclasses import replace
 from pathlib import Path
 
 import cv2
@@ -78,6 +83,12 @@ def package_fixture(tmp_path):
     (repo_root / "colab" / "hair_colab_enterprise.ipynb").write_text(
         '{"cells": []}\n', encoding="utf-8"
     )
+    real_repo = Path(__file__).resolve().parents[1]
+    (repo_root / "hair_annotation").mkdir()
+    for name in ("__init__.py", "config.py", "types.py", "localization.py", "matching.py", "export.py"):
+        shutil.copy2(real_repo / "hair_annotation" / name, repo_root / "hair_annotation" / name)
+    for name in ("test_box_first_config.py", "test_localization.py", "test_matching.py", "test_platform_export.py"):
+        shutil.copy2(real_repo / "tests" / name, repo_root / "tests" / name)
     return prep.PackageInputs(
         workbook=workbook,
         product_images=products,
@@ -261,6 +272,10 @@ def test_build_runtime_package_copies_bytes_and_uses_ascii_archive_paths(
     with zipfile.ZipFile(destination) as archive:
         names = archive.namelist()
         assert all(name.isascii() for name in names)
+        assert len([name for name in names if name.startswith("hair_colab/references/")]) == 2
+        assert len([name for name in names if name.startswith("hair_colab/shelf_images/")]) == 2
+        for source in (package_fixture.shelf_images / "a.jpg", package_fixture.shelf_images / "b.JPG"):
+            assert archive.read(f"hair_colab/shelf_images/{source.name}") == source.read_bytes()
         assert archive.read("hair_colab/yoloe_autolabel.py") == b"engine-bytes"
         assert archive.read("hair_colab/colab_runtime.py") == (package_fixture.repo_root / "colab_runtime.py").read_bytes()
         assert (
@@ -376,3 +391,134 @@ def test_cli_metadata_output_contains_only_registry_files(package_fixture, tmp_p
         assert (metadata / "reference_prompts.yaml").read_bytes() == archive.read(
             "hair_colab/reference_prompts.yaml"
         )
+
+
+def test_runtime_archive_contains_box_first_modules_and_tests(package_fixture, tmp_path):
+    destination = tmp_path / "runtime.zip"
+    prep.build_runtime_package(package_fixture, destination)
+    with zipfile.ZipFile(destination) as archive:
+        names = set(archive.namelist())
+        for name in ("__init__.py", "config.py", "types.py", "localization.py", "matching.py", "export.py"):
+            assert f"hair_colab/hair_annotation/{name}" in names
+        for name in ("test_box_first_config.py", "test_localization.py", "test_matching.py", "test_platform_export.py"):
+            assert f"hair_colab/tests/{name}" in names
+        assert not any(part in {".git", ".DS_Store", "__pycache__", ".venv"} for name in names for part in Path(name).parts)
+
+
+@pytest.mark.parametrize("field", ["workbook", "overrides", "translations", "product_images", "shelf_images", "repo_root"])
+def test_builder_rejects_reviewed_labels_inputs_before_reading(package_fixture, tmp_path, field, monkeypatch):
+    forbidden = tmp_path / "reviewed_labels" / "missing"
+    invalid = replace(package_fixture, **{field: forbidden})
+    monkeypatch.setattr(prep, "load_sheet2_skus", lambda *args: pytest.fail("must reject before reading workbook"))
+    with pytest.raises(ValueError, match="reviewed_labels"):
+        prep.build_runtime_package(invalid, tmp_path / "runtime.zip")
+
+
+@pytest.mark.parametrize("source", ["workbook", "overrides", "translations"])
+def test_builder_refuses_input_overwrite_even_with_overwrite(package_fixture, source):
+    destination = getattr(package_fixture, source)
+    before = destination.read_bytes()
+    with pytest.raises(ValueError, match="alias|input"):
+        prep.build_runtime_package(package_fixture, destination, overwrite=True)
+    assert destination.read_bytes() == before
+
+
+def test_builder_refuses_hardlink_alias_of_input(package_fixture, tmp_path):
+    destination = tmp_path / "runtime.zip"
+    os.link(package_fixture.workbook, destination)
+    before = package_fixture.workbook.read_bytes()
+    with pytest.raises(ValueError, match="alias|input"):
+        prep.build_runtime_package(package_fixture, destination, overwrite=True)
+    assert destination.read_bytes() == before
+
+
+@pytest.mark.parametrize("directory", ["product_images", "shelf_images"])
+def test_builder_refuses_archive_inside_image_sources(package_fixture, directory):
+    destination = getattr(package_fixture, directory) / "runtime.zip"
+    with pytest.raises(ValueError, match="input|source"):
+        prep.build_runtime_package(package_fixture, destination)
+    assert not destination.exists()
+
+
+def test_builder_rejects_reviewed_labels_output(package_fixture, tmp_path):
+    destination = tmp_path / "Reviewed_Labels" / "runtime.zip"
+    with pytest.raises(ValueError, match="reviewed_labels"):
+        prep.build_runtime_package(package_fixture, destination)
+    assert not destination.parent.exists()
+
+
+def test_metadata_export_refuses_replacing_directory_containing_archive(package_fixture, tmp_path):
+    destination = tmp_path / "runtime.zip"
+    prep.build_runtime_package(package_fixture, destination)
+    before = destination.read_bytes()
+    with pytest.raises(ValueError, match="input|source|archive"):
+        prep.export_registry_metadata(destination, tmp_path, overwrite=True)
+    assert destination.read_bytes() == before
+
+
+def test_metadata_export_rejects_reviewed_labels_before_archive_read(tmp_path, monkeypatch):
+    monkeypatch.setattr(zipfile, "ZipFile", lambda *args: pytest.fail("must not open reviewed_labels"))
+    with pytest.raises(ValueError, match="reviewed_labels"):
+        prep.export_registry_metadata(tmp_path / "reviewed_labels" / "missing.zip", tmp_path / "metadata")
+    assert not (tmp_path / "metadata").exists()
+
+
+@pytest.mark.parametrize("field", ["product_images", "shelf_images"])
+def test_cli_rejects_metadata_in_image_sources_before_build(package_fixture, tmp_path, field):
+    metadata = getattr(package_fixture, field) / "generated"
+    archive = tmp_path / "runtime.zip"
+    result = prep.main([
+        "--workbook", str(package_fixture.workbook),
+        "--product-images", str(package_fixture.product_images),
+        "--shelf-images", str(package_fixture.shelf_images),
+        "--repo-root", str(package_fixture.repo_root),
+        "--overrides", str(package_fixture.overrides),
+        "--translations", str(package_fixture.translations),
+        "--expected-skus", "2", "--expected-shelves", "2",
+        "--output", str(archive), "--metadata-output", str(metadata), "--overwrite",
+    ])
+    assert result == 2
+    assert not metadata.exists()
+    assert not archive.exists()
+
+
+def test_cli_refuses_metadata_replacing_repository_source(package_fixture, tmp_path):
+    archive = tmp_path / "runtime.zip"
+    before = (package_fixture.repo_root / "yoloe_autolabel.py").read_bytes()
+    result = prep.main([
+        "--workbook", str(package_fixture.workbook),
+        "--product-images", str(package_fixture.product_images),
+        "--shelf-images", str(package_fixture.shelf_images),
+        "--repo-root", str(package_fixture.repo_root),
+        "--overrides", str(package_fixture.overrides),
+        "--translations", str(package_fixture.translations),
+        "--expected-skus", "2", "--expected-shelves", "2",
+        "--output", str(archive), "--metadata-output", str(package_fixture.repo_root), "--overwrite",
+    ])
+    assert result == 2
+    assert not archive.exists()
+    assert (package_fixture.repo_root / "yoloe_autolabel.py").read_bytes() == before
+
+
+def test_runtime_extract_runs_real_model_free_tests_and_validation(package_fixture, tmp_path):
+    # Synthetic development data, not a claim about the unavailable real data.
+    inputs = replace(package_fixture, repo_root=Path(__file__).resolve().parents[1])
+    archive_path = tmp_path / "runtime.zip"
+    prep.build_runtime_package(inputs, archive_path)
+    extracted = tmp_path / "extracted"
+    with zipfile.ZipFile(archive_path) as archive:
+        archive.extractall(extracted)
+    project = extracted / "hair_colab"
+    result = subprocess.run([sys.executable, "-m", "pytest", "-q"], cwd=project, text=True, capture_output=True)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "passed" in result.stdout
+    print(result.stdout.strip())
+    validation = subprocess.run([
+        sys.executable, "yoloe_autolabel.py", "--config", "config.yaml",
+        "--validate-only", "--require-enabled-count", "2",
+    ], cwd=project, text=True, capture_output=True)
+    assert validation.returncode == 0, validation.stdout + validation.stderr
+    assert "Validation successful: 2 SKU(s), 2 image(s)" in validation.stdout
+    print(validation.stdout.strip())
+    # Running the extracted suite cannot silently import the repository engine.
+    assert (project / "yoloe_autolabel.py").read_bytes() == (inputs.repo_root / "yoloe_autolabel.py").read_bytes()

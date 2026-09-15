@@ -47,6 +47,39 @@ class PackageReport:
     shelf_count: int
 
 
+def _safe_input_path(path: Path) -> Path:
+    from yoloe_autolabel import _absolute_lexical, _assert_input_allowed
+
+    lexical = _absolute_lexical(path)
+    resolved = _assert_input_allowed(lexical)
+    if resolved != lexical:
+        raise ValueError(f"Package input is redirected by a symlink or junction: {path}")
+    return resolved
+
+
+def _safe_destination(path: Path, protected_inputs: Sequence[Path]) -> Path:
+    from yoloe_autolabel import _absolute_lexical, _reject_output_alias, _reject_reviewed_labels
+
+    lexical = _absolute_lexical(path)
+    _reject_reviewed_labels(lexical)
+    destination = lexical.resolve()
+    if destination != lexical:
+        raise ValueError(f"Package destination is redirected by a symlink or junction: {path}")
+    sources = [_safe_input_path(source) for source in protected_inputs]
+    _reject_output_alias(destination, sources)
+    for source in sources:
+        if source.is_relative_to(destination) or (source.is_dir() and destination.is_relative_to(source)):
+            raise ValueError(f"Package destination overlaps a source input: {destination} -> {source}")
+    return destination
+
+
+def _package_input_paths(inputs: PackageInputs) -> list[Path]:
+    return [_safe_input_path(path) for path in (
+        inputs.workbook, inputs.overrides, inputs.translations,
+        inputs.product_images, inputs.shelf_images, inputs.repo_root,
+    )]
+
+
 def normalize_product_name(value: str) -> str:
     """Normalize a product name only for exact, deterministic matching."""
     return " ".join(unicodedata.normalize("NFC", value).split()).casefold()
@@ -73,7 +106,7 @@ def load_sheet2_skus(path: Path, expected_count: int = 89) -> list[HairSku]:
     except ImportError as exc:
         raise RuntimeError("openpyxl is required to read the SKU workbook") from exc
 
-    workbook_path = Path(path).resolve()
+    workbook_path = _safe_input_path(path)
     if not workbook_path.is_file():
         raise ValueError(f"Workbook does not exist: {workbook_path}")
     try:
@@ -129,7 +162,7 @@ def load_reference_overrides(path: Path) -> dict[str, str]:
     except ImportError as exc:
         raise RuntimeError("PyYAML is required to read reference overrides") from exc
 
-    override_path = Path(path).resolve()
+    override_path = _safe_input_path(path)
     try:
         payload = yaml.safe_load(override_path.read_text(encoding="utf-8"))
     except (OSError, yaml.YAMLError) as exc:
@@ -155,7 +188,7 @@ def load_sku_translations(path: Path, skus: Sequence[HairSku]) -> dict[str, str]
     except ImportError as exc:
         raise RuntimeError("PyYAML is required to read SKU translations") from exc
 
-    translation_path = Path(path).resolve()
+    translation_path = _safe_input_path(path)
     try:
         payload = yaml.safe_load(translation_path.read_text(encoding="utf-8"))
     except (OSError, yaml.YAMLError) as exc:
@@ -199,13 +232,13 @@ def match_product_references(
     overrides: Mapping[str, str],
 ) -> dict[int, Path]:
     """Match every SKU to exactly one reference without fuzzy matching."""
-    root = Path(product_dir).resolve()
+    root = _safe_input_path(product_dir)
     if not root.is_dir():
         raise ValueError(f"Product image directory does not exist: {root}")
     images = sorted(
         (
-            path.resolve()
-            for path in root.iterdir()
+            path
+            for path in (_safe_input_path(entry) for entry in root.iterdir())
             if path.is_file() and path.suffix.casefold() in _PRODUCT_EXTENSIONS
         ),
         key=lambda path: (path.name.casefold(), path.name),
@@ -233,7 +266,7 @@ def match_product_references(
         name_key = normalize_product_name(sku.sku_name)
         if name_key in normalized_overrides:
             _, filename = normalized_overrides[name_key]
-            candidate = (root / filename).resolve()
+            candidate = _safe_input_path(root / filename)
             if candidate.parent != root or not candidate.is_file():
                 raise ValueError(
                     f"Reference override for {sku.sku_name!r} does not resolve to a file: {filename}"
@@ -282,6 +315,7 @@ def _load_cv2():
 def _validate_decodable_image(path: Path, label: str) -> None:
     import numpy as np
 
+    path = _safe_input_path(path)
     cv2 = _load_cv2()
     try:
         encoded = np.frombuffer(Path(path).read_bytes(), dtype=np.uint8)
@@ -294,13 +328,13 @@ def _validate_decodable_image(path: Path, label: str) -> None:
 
 def discover_shelf_images(path: Path, expected_count: int = 632) -> list[Path]:
     """Return the validated flat set of ASCII-named shelf JPGs."""
-    root = Path(path).resolve()
+    root = _safe_input_path(path)
     if not root.is_dir():
         raise ValueError(f"Shelf image directory does not exist: {root}")
     images = sorted(
         (
-            candidate.resolve()
-            for candidate in root.iterdir()
+            candidate
+            for candidate in (_safe_input_path(entry) for entry in root.iterdir())
             if candidate.is_file() and candidate.suffix.casefold() in _SHELF_EXTENSIONS
         ),
         key=lambda candidate: (candidate.name.casefold(), candidate.name),
@@ -342,6 +376,16 @@ def _required_repo_files(repo_root: Path) -> dict[Path, Path]:
         repo_root / "colab_runtime.py": Path("colab_runtime.py"),
         repo_root / "requirements.txt": Path("requirements.txt"),
         repo_root / "tests" / "test_yoloe_autolabel.py": Path("tests/test_yoloe_autolabel.py"),
+        repo_root / "hair_annotation" / "__init__.py": Path("hair_annotation/__init__.py"),
+        repo_root / "hair_annotation" / "config.py": Path("hair_annotation/config.py"),
+        repo_root / "hair_annotation" / "types.py": Path("hair_annotation/types.py"),
+        repo_root / "hair_annotation" / "localization.py": Path("hair_annotation/localization.py"),
+        repo_root / "hair_annotation" / "matching.py": Path("hair_annotation/matching.py"),
+        repo_root / "hair_annotation" / "export.py": Path("hair_annotation/export.py"),
+        repo_root / "tests" / "test_box_first_config.py": Path("tests/test_box_first_config.py"),
+        repo_root / "tests" / "test_localization.py": Path("tests/test_localization.py"),
+        repo_root / "tests" / "test_matching.py": Path("tests/test_matching.py"),
+        repo_root / "tests" / "test_platform_export.py": Path("tests/test_platform_export.py"),
         repo_root / "colab" / "config.yaml": Path("config.yaml"),
         repo_root / "colab" / "hair_colab_enterprise.ipynb": Path("hair_colab_enterprise.ipynb"),
     }
@@ -422,10 +466,12 @@ def export_registry_metadata(
     archive_path: Path,
     destination: Path,
     overwrite: bool = False,
+    *,
+    protected_inputs: Sequence[Path] = (),
 ) -> Path:
     """Export the archive's exact generated registry files atomically."""
-    source_archive = Path(archive_path).resolve()
-    output_directory = Path(destination).resolve()
+    source_archive = _safe_input_path(archive_path)
+    output_directory = _safe_destination(destination, [source_archive, *protected_inputs])
     if output_directory.exists() and not overwrite:
         raise FileExistsError(f"Metadata directory already exists: {output_directory}")
     if output_directory.exists() and not output_directory.is_dir():
@@ -466,12 +512,16 @@ def build_runtime_package(
     overwrite: bool = False,
 ) -> PackageReport:
     """Validate sources and atomically create the Colab runtime ZIP."""
-    archive_path = Path(destination).resolve()
+    protected_inputs = _package_input_paths(inputs)
+    # The repository is an operator-controlled output location, not an image
+    # source tree. Protect its packaged files individually below.
+    archive_path = _safe_destination(destination, protected_inputs[:-1])
     if archive_path.exists() and not overwrite:
         raise FileExistsError(f"Archive already exists: {archive_path}")
-    repo_root = Path(inputs.repo_root).resolve()
+    repo_root = protected_inputs[-1]
     required_files = _required_repo_files(repo_root)
     for source in required_files:
+        _safe_input_path(source)
         if not source.is_file():
             raise ValueError(f"Required package input is missing: {source}")
 
@@ -482,6 +532,7 @@ def build_runtime_package(
     for source in references.values():
         _validate_decodable_image(source, "Product reference")
     shelves = discover_shelf_images(inputs.shelf_images, inputs.expected_shelves)
+    _safe_destination(archive_path, [*required_files, *references.values(), *shelves])
 
     archive_path.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(
@@ -538,8 +589,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     try:
-        report = build_runtime_package(
-            PackageInputs(
+        inputs = PackageInputs(
                 workbook=Path(args.workbook),
                 product_images=Path(args.product_images),
                 shelf_images=Path(args.shelf_images),
@@ -548,7 +598,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                 translations=Path(args.translations),
                 expected_skus=args.expected_skus,
                 expected_shelves=args.expected_shelves,
-            ),
+            )
+        if args.metadata_output:
+            metadata_inputs = [
+                *_package_input_paths(inputs)[:-1],
+                *_required_repo_files(_safe_input_path(inputs.repo_root)),
+                Path(args.output),
+            ]
+            _safe_destination(Path(args.metadata_output), metadata_inputs)
+        report = build_runtime_package(
+            inputs,
             Path(args.output),
             overwrite=args.overwrite,
         )
@@ -561,6 +620,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 report.archive_path,
                 Path(args.metadata_output),
                 overwrite=args.overwrite,
+                protected_inputs=metadata_inputs,
             )
             print(f"Exported registry metadata to {metadata_path}")
         return 0
