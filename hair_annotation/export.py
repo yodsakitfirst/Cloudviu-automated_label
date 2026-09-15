@@ -60,6 +60,33 @@ class _ProjectSettings:
     protected: tuple[Path, ...]
 
 
+def _reference_inputs(definitions: Path, base: Path) -> list[Path]:
+    """Collect every mapped source without filtering SKUs or loading images."""
+    definitions = _input(definitions)
+    try:
+        data = yaml.safe_load(definitions.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, yaml.YAMLError) as exc:
+        raise ValueError(f"Cannot read reference definitions: {definitions}") from exc
+    if not isinstance(data, dict) or not isinstance(data.get("references"), list):
+        raise ValueError("Reference YAML must contain a references list")
+    sources = [definitions]
+    for index, entry in enumerate(data["references"]):
+        if not isinstance(entry, dict):
+            raise ValueError(f"Reference {index} must be a mapping")
+        value = entry.get("image_path", entry.get("image", entry.get("path")))
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"Reference {index} has no image path")
+        candidate = Path(value).expanduser()
+        if not candidate.is_absolute():
+            candidate = base / candidate
+        # Check the original lexical path before resolving, including disabled SKUs.
+        source = _input(candidate)
+        if not source.is_file():
+            raise ValueError(f"Mapped reference image is missing: {source}")
+        sources.append(source)
+    return sources
+
+
 def _project_settings(project: Path) -> _ProjectSettings:
     root = _input(Path(project))
     config_path = _input(root / "config.yaml")
@@ -92,7 +119,7 @@ def _project_settings(project: Path) -> _ProjectSettings:
         defaults = ExportConfig(export_data["train_fraction"], export_data["split_seed"])
         for alias in ("references", "reference_definitions"):
             if alias in dataset:
-                protected.append(configured(alias))
+                protected.extend(_reference_inputs(configured(alias), root))
                 break
     else:
         images = _input(root / "shelf_images")

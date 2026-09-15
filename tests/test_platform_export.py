@@ -2,6 +2,7 @@ import csv
 import hashlib
 import os
 import zipfile
+from pathlib import Path
 
 import pytest
 import yaml
@@ -236,3 +237,56 @@ def test_packagers_reject_symlink_destination(platform_project, tmp_path, kind):
         else:
             package_review_bundle(platform_project, link, overwrite=True)
     assert target.read_bytes() == b"sentinel"
+
+
+def configure_reference_inputs(project, reference_entries):
+    # Deliberately nest the definition YAML: CLI paths remain project-relative.
+    definitions = project / "definitions" / "references.yaml"
+    definitions.parent.mkdir(exist_ok=True)
+    definitions.write_text(yaml.safe_dump({"references": reference_entries}), encoding="utf-8")
+    config = {"dataset": {"sku_manifest": "sku_manifest.csv", "shelf_images": "shelf_images", "references": "definitions/references.yaml"}, "output": {"root": "output"}, "export": {"train_fraction": 0.9, "split_seed": "hair-osa-v1"}}
+    (project / "config.yaml").write_text(yaml.safe_dump(config), encoding="utf-8")
+
+
+@pytest.mark.parametrize("kind", ["platform", "review"])
+@pytest.mark.parametrize("hardlink", [False, True])
+def test_packagers_protect_all_mapped_reference_images(platform_project, tmp_path, kind, hardlink):
+    reference = tmp_path / "external_products" / "product.jpg"
+    reference.parent.mkdir()
+    reference.write_bytes(b"original-product-reference")
+    relative_reference = Path(os.path.relpath(reference, platform_project)).as_posix()
+    # Include a disabled permanent SKU: safety must not filter mapped files.
+    manifest = platform_project / "sku_manifest.csv"
+    rows = list(csv.DictReader(manifest.open(encoding="utf-8")))
+    rows[-1]["enabled"] = "false"
+    with manifest.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=rows[0].keys())
+        writer.writeheader()
+        writer.writerows(rows)
+    configure_reference_inputs(platform_project, [{"class_id": 88, "image_path": relative_reference}])
+    destination = reference
+    if hardlink:
+        destination = tmp_path / "reference_alias.zip"
+        os.link(reference, destination)
+    with pytest.raises(ValueError, match="alias"):
+        if kind == "platform":
+            package_platform_dataset(platform_project, destination, export_config(), overwrite=True)
+        else:
+            package_review_bundle(platform_project, destination, overwrite=True)
+    assert reference.read_bytes() == b"original-product-reference"
+
+
+@pytest.mark.parametrize("kind", ["platform", "review"])
+def test_packagers_reject_lexical_reviewed_labels_reference_mapping(platform_project, tmp_path, kind):
+    reviewed = platform_project / "reviewed_labels" / "product.jpg"
+    reviewed.parent.mkdir()
+    reviewed.write_bytes(b"human-source")
+    configure_reference_inputs(platform_project, [{"class_id": 0, "image_path": "reviewed_labels/product.jpg"}])
+    destination = tmp_path / "absent" / "archive.zip"
+    with pytest.raises(ValueError, match="reviewed_labels"):
+        if kind == "platform":
+            package_platform_dataset(platform_project, destination, export_config())
+        else:
+            package_review_bundle(platform_project, destination)
+    assert not destination.parent.exists()
+    assert reviewed.read_bytes() == b"human-source"
