@@ -132,9 +132,20 @@ def test_colab_config_has_approved_box_first_defaults():
     assert config["yoloe"] == {"model": "yoloe-26l-seg.pt", "imgsz": 1280, "device": 0}
     assert config["localization"] == {
         "tile_size": 1024, "overlap": 0.20,
-        "prompts": ["shampoo bottle", "conditioner bottle", "hair treatment pouch", "boxed hair product", "hair care multipack"],
-        "conf": 0.10, "iou": 0.50, "min_side": 12, "max_area_ratio": 0.10,
+        "prompts": [
+            "retail personal care product", "hair care product", "shampoo bottle",
+            "conditioner bottle", "cosmetic bottle", "pump bottle", "aerosol can",
+            "squeeze tube", "hair treatment pouch", "product sachet", "cosmetic jar",
+            "boxed hair product", "hair care multipack",
+        ],
+        "conf": 0.05, "iou": 0.50, "min_side": 12, "max_area_ratio": 0.10,
         "min_aspect_ratio": 0.15, "max_aspect_ratio": 4.0, "nms_iou": 0.50,
+        "recall_retry": {
+            "enabled": True, "min_candidates_per_megapixel": 10.0,
+            "tile_size": 640, "overlap": 0.30, "conf": 0.02, "iou": 0.60,
+            "min_side": 6, "max_area_ratio": 0.20, "min_aspect_ratio": 0.08,
+            "max_aspect_ratio": 8.0, "nms_iou": 0.70,
+        },
     }
     assert config["matching"] == {
         "model": "ViT-B-32", "pretrained": "laion2b_s34b_b79k",

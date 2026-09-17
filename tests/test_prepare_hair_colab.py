@@ -34,6 +34,31 @@ def write_image(path: Path) -> None:
     path.write_bytes(encoded.tobytes())
 
 
+def write_macos_zip(path: Path, files: dict[str, bytes]) -> None:
+    """Write UTF-8 names while deliberately clearing ZIP's UTF-8 flag."""
+    with zipfile.ZipFile(path, "w") as archive:
+        for name, payload in files.items():
+            archive.writestr(name, payload)
+    data = bytearray(path.read_bytes())
+    offset = 0
+    while True:
+        offset = data.find(b"PK\x03\x04", offset)
+        if offset < 0:
+            break
+        flags = int.from_bytes(data[offset + 6 : offset + 8], "little") & ~0x800
+        data[offset + 6 : offset + 8] = flags.to_bytes(2, "little")
+        offset += 4
+    offset = 0
+    while True:
+        offset = data.find(b"PK\x01\x02", offset)
+        if offset < 0:
+            break
+        flags = int.from_bytes(data[offset + 8 : offset + 10], "little") & ~0x800
+        data[offset + 8 : offset + 10] = flags.to_bytes(2, "little")
+        offset += 4
+    path.write_bytes(data)
+
+
 def test_source_decoder_supports_native_thai_path(tmp_path):
     path = tmp_path / "สินค้า หนึ่ง.png"
     write_image(path)
@@ -170,7 +195,9 @@ def test_match_product_references_uses_exact_names_and_explicit_override(tmp_pat
     )
 
     assert matched == {0: exact.resolve(), 1: override.resolve()}
-    assert prep.ascii_reference_name(skus[0], exact) == "class_000_8851932487177.png"
+    assert prep.ascii_reference_name(
+        skus[0], exact, "Product One"
+    ) == "class_000_8851932487177_product-one.png"
 
 
 def test_match_product_references_rejects_ambiguous_names(tmp_path):
@@ -279,7 +306,7 @@ def test_build_runtime_package_copies_bytes_and_uses_ascii_archive_paths(
         assert archive.read("hair_colab/yoloe_autolabel.py") == b"engine-bytes"
         assert archive.read("hair_colab/colab_runtime.py") == (package_fixture.repo_root / "colab_runtime.py").read_bytes()
         assert (
-            archive.read("hair_colab/references/class_000_8851932487177.png")
+            archive.read("hair_colab/references/class_000_8851932487177_product-one.png")
             == (package_fixture.product_images / "สินค้า หนึ่ง.png").read_bytes()
         )
         manifest = list(
@@ -307,6 +334,47 @@ def test_build_runtime_package_copies_bytes_and_uses_ascii_archive_paths(
                 "enabled": "true",
             },
         ]
+
+
+def test_build_runtime_package_recovers_macos_thai_zip_names(
+    package_fixture, tmp_path
+):
+    source_zip = tmp_path / "references.zip"
+    source_files = {
+        path.name: path.read_bytes()
+        for path in package_fixture.product_images.iterdir()
+    }
+    write_macos_zip(source_zip, source_files)
+    destination = tmp_path / "runtime.zip"
+
+    report = prep.build_runtime_package(
+        replace(package_fixture, product_images=source_zip), destination
+    )
+
+    assert report.reference_count == 2
+    with zipfile.ZipFile(destination) as archive:
+        reference_names = sorted(
+            name
+            for name in archive.namelist()
+            if name.startswith("hair_colab/references/")
+        )
+        assert reference_names == [
+            "hair_colab/references/class_000_8851932487177_product-one.png",
+            "hair_colab/references/class_001_8851932487178_product-two.jpg",
+        ]
+        assert archive.read(reference_names[0]) == source_files["สินค้า หนึ่ง.png"]
+
+
+def test_product_zip_rejects_nested_members(package_fixture, tmp_path):
+    source_zip = tmp_path / "nested.zip"
+    with zipfile.ZipFile(source_zip, "w") as archive:
+        archive.writestr("nested/product.png", b"not-safe")
+
+    with pytest.raises(ValueError, match="flat image files"):
+        prep.build_runtime_package(
+            replace(package_fixture, product_images=source_zip),
+            tmp_path / "runtime.zip",
+        )
 
 
 def test_build_runtime_package_refuses_to_replace_an_archive(package_fixture, tmp_path):

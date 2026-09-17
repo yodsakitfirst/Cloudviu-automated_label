@@ -6,7 +6,7 @@ This tool bootstraps candidate bounding boxes for an On-Shelf Availability datas
 
 The runtime builder and model-free tests are implemented. The intended real dataset has 89 permanent classes (IDs 0–88 in workbook `Sheet2` row order), 89 product references, and 632 shelf images. This checkout does **not** currently contain a rebuilt `dist/hair_colab_runtime.zip`: the real product-reference source directory is missing. Synthetic packaging tests verify code composition and byte preservation, not the completeness or accuracy of that real dataset.
 
-The builder never renames or modifies original images or workbook inputs. References receive ASCII-safe filenames such as `class_000_8851932487177.jpg` inside the archive. `sku_manifest.csv` preserves text barcodes and original Thai names alongside English class names. The temporary `Needs Review` class is ID 89; it is not a permanent SKU.
+The builder never renames or modifies original images, reference ZIPs, or workbook inputs. `--product-images` accepts either a flat image directory or a ZIP archive, including macOS-created ZIPs whose Thai UTF-8 names are missing the ZIP UTF-8 flag. References receive readable ASCII filenames such as `class_000_8851932487177_dove-blue-shampoo-conditioner-slim-pack-6-x-360-330-ml.jpg` inside the runtime archive. `sku_manifest.csv` preserves text barcodes and original Thai names alongside English class names. The temporary `Needs Review` class is ID 89; it is not a permanent SKU.
 
 ## Setup and operator sequence
 
@@ -20,12 +20,12 @@ py -3.11 -m venv .venv
 
 On Linux/macOS use `python3.11` and `.venv/bin/python` instead. For Colab Enterprise, follow [colab/README.md](colab/README.md) and import `colab/hair_colab_enterprise.ipynb`. Only runtime storage is used: no mounted cloud drive or storage-account integration. Uploaded and generated files disappear when the runtime is deleted.
 
-Once the missing verified product references are available, build the real upload archive using the actual source directories (replace these placeholders; extract the shelf archive first):
+Once the verified product references are available, build the real upload archive using the actual inputs (the product references may remain zipped; extract the shelf archive first):
 
 ```powershell
 .venv\Scripts\python.exe prepare_hair_colab.py `
   --workbook "C:\path\HAIR SKU list (with Account list).xlsx" `
-  --product-images "C:\path\HAIR_product_images" `
+  --product-images "C:\path\HAIR_SKU2_IMAGE1_images.zip" `
   --shelf-images "C:\path\HAIR_shelf_images" `
   --translations colab/sku_name_translations.yaml `
   --metadata-output colab/generated `
@@ -75,7 +75,7 @@ The manifest columns are `class_id,barcode,brand,sku_name,sku_name_th,enabled`. 
 
 Reference YAML contains a `references` list with `class_id`, `image`, and optional `bbox: [x1, y1, x2, y2]` in source pixels. An explicit ROI is cropped before matching; otherwise localization selects up to three reference views and falls back to a full-image crop marked low quality when needed. Every enabled SKU needs a valid decodable reference. Inspect `reference_diagnostics.json` for fallback quality.
 
-`colab/config.yaml` defines approved defaults: 1024-pixel tiles, 20% overlap, 1280-pixel detector input, geometry filtering, class-agnostic NMS, 80% visual / 20% text similarity, score threshold 0.24, and top-two margin threshold 0.02. Low-score or ambiguous candidates keep their boxes and top-three suggestions but receive temporary class 89. Generic localization prompt IDs are not SKU labels.
+`colab/config.yaml` defines recall-first defaults for manual cleanup: broad package prompts, 1024-pixel tiles with 20% overlap, a 0.05 primary detector threshold, and 1280-pixel detector input. Images with fewer than 10 retained candidates per megapixel automatically receive a second localization pass using 640-pixel tiles, 30% overlap, a 0.02 threshold, and relaxed geometry/NMS limits; primary and retry candidates are merged before matching. Matching uses 80% visual / 20% text similarity, score threshold 0.24, and top-two margin threshold 0.02. Low-score or ambiguous candidates keep their boxes and top-three suggestions but receive temporary class 89. Generic localization prompt IDs are not SKU labels. These settings intentionally prefer extra boxes that a reviewer can delete over silent misses.
 
 ## Outputs, resume, and safety
 
@@ -91,7 +91,7 @@ output/raw_predictions/
   run.json
 ```
 
-Each YOLO row is `class_id x_center y_center width height`, normalized with six decimal places. Images with no candidates receive empty labels and explicit review diagnostics. Metadata records tight pixel geometry, localization confidence/provenance, accepted/review status, and ranked permanent SKU identities/scores. Run totals expose geometry rejections, duplicates, permanent/review assignments, score summaries, errors, counters, and effective settings/paths.
+Each YOLO row is `class_id x_center y_center width height`, normalized with six decimal places. Images with no candidates receive empty labels and explicit review diagnostics. Metadata records tight pixel geometry, localization confidence/provenance, accepted/review status, and ranked permanent SKU identities/scores. Per-image localization diagnostics record whether the recall retry ran, why it ran, and the primary, retry, and merged candidate counts. Run totals expose geometry rejections, duplicates, permanent/review assignments, score summaries, errors, counters, and effective settings/paths.
 
 Pilot outputs use `pilot_output`; full outputs use `output`. Labels are completion markers and are finalized after sidecars. Reruns skip completed images only if retained metadata/review queue and stored provenance match. Changing model weights, settings, SKU identities, or references invalidates a resume. Explicit `--overwrite` affects selected raw candidates only, never human-reviewed labels. Do not point any source or output at `reviewed_labels`.
 

@@ -1,12 +1,12 @@
 # Colab Enterprise runtime-local workflow
 
-Generic YOLOE text prompts propose tight boxes in overlapping shelf tiles; OpenCLIP ranks those crops against all enabled HAIR SKU identities. Low-score or ambiguous boxes use temporary class 89, `Needs Review`. These are raw suggestions, never approved training truth or final OSA results.
+Broad YOLOE package prompts propose tight boxes in overlapping shelf tiles; OpenCLIP ranks those crops against all enabled HAIR SKU identities. Sparse images automatically receive a more aggressive second localization pass, and its candidates are merged with the primary pass. Low-score or ambiguous boxes use temporary class 89, `Needs Review`. These recall-first settings intentionally tolerate extra boxes for manual deletion. The results are raw suggestions, never approved training truth or final OSA results.
 
 ## Before opening the notebook
 
 Import `colab/hair_colab_enterprise.ipynb`. A rebuilt `dist/hair_colab_runtime.zip` must be prepared from all verified source inputs before upload. This checkout has no rebuilt real-data ZIP yet: the product-reference source directory is missing. The intended dataset is 89 permanent SKUs, 89 product references, and 632 shelf images. Synthetic packaging verification does not establish that real-data gate.
 
-The builder uses an explicit code/test allowlist, ASCII archive paths, and checksum-verified image copies without modifying original inputs. `sku_manifest.csv` maps numeric permanent IDs 0–88 to English `sku_name` values and preserves original Thai `sku_name_th` values and text barcodes. Prepared reference names look like `class_000_8851932487177.jpg`.
+The builder uses an explicit code/test allowlist, ASCII archive paths, and checksum-verified image copies without modifying original inputs. Product references may be supplied as a flat directory or ZIP; legacy macOS ZIPs with unflagged Thai UTF-8 filenames are recovered automatically. `sku_manifest.csv` maps numeric permanent IDs 0–88 to English `sku_name` values and preserves original Thai `sku_name_th` values and text barcodes. Prepared reference names include the English class name, for example `class_000_8851932487177_dove-blue-shampoo-conditioner-slim-pack-6-x-360-330-ml.jpg`.
 
 ## Runtime steps
 
@@ -16,7 +16,7 @@ The builder uses an explicit code/test allowlist, ASCII archive paths, and check
 4. Install dependencies with `pip install -r requirements.txt`, then run `pytest -q`. These tests use fake model backends; they require no weights or GPU.
 5. Validate with `--validate-only --require-enabled-count 89`. The real package must report `Validation successful: 89 SKU(s), 632 image(s)` before continuing.
 6. Create the pilot with `write_pilot_config(project, max_images=10)` and run it. It limits images only: all 89 enabled SKU identities remain available, regardless of legacy class-selection controls.
-7. Inspect the preview grid and original images for box tightness, misses, and incorrect SKU suggestions. Read the printed `pilot_output/raw_predictions/run.json`, geometry rejection counts, duplicate removals, zero-candidate images, `Needs Review` ratio, and top-score distributions. Scores rank suggestions; they are not calibrated probabilities. Investigate errors and low-quality reference fallbacks. Adjust and repeat if needed.
+7. Inspect the preview grid and original images for box tightness, misses, false positives, and incorrect SKU suggestions. Read the printed `pilot_output/raw_predictions/run.json`, geometry rejection counts, duplicate removals, zero-candidate images, `Needs Review` ratio, and top-score distributions. Each image's `localization` block also reports `recall_retry_triggered`, its reason, and primary/retry/merged counts. Scores rank suggestions; they are not calibrated probabilities. Investigate errors and low-quality reference fallbacks. Adjust and repeat if needed.
 8. Run the separately marked full-run cell only after the pilot is acceptable. It processes all 632 images against all 89 enabled classes.
 9. Package results with the two-destination `colab_runtime.package_results` call.
 10. Download **both** `hair_ultralytics_platform.zip` and `hair_annotation_review.zip` from the Files pane before deleting the runtime.
@@ -44,7 +44,7 @@ This is a partial edit example, not a replacement config. Paths resolve relative
 
 ## Pilot, resume, and two ZIPs
 
-Pilot candidates live beneath `pilot_output/raw_predictions`; full candidates live beneath `output/raw_predictions`. This separation keeps pilot completion markers from skipping full-run images. Within one runtime, rerunning without overwrite skips completed labels only when stored provenance and retained metadata/review queue match the model, settings, identities, and references. Overwrite regenerates selected raw suggestions only. `reviewed_labels` is never an automated input or output.
+Pilot candidates live beneath `pilot_output/raw_predictions`; full candidates live beneath `output/raw_predictions`. This separation keeps pilot completion markers from skipping full-run images. The recall retry adds work only to sparse images, so it can make the pilot and full run slower. Within one runtime, rerunning without overwrite skips completed labels only when stored provenance and retained metadata/review queue match the model, settings, identities, and references. Overwrite regenerates selected raw suggestions only. `reviewed_labels` is never an automated input or output.
 
 `hair_ultralytics_platform.zip` goes to Ultralytics Platform. It has root `data.yaml`, original image bytes, matching numeric YOLO labels, and a deterministic 90% train / 10% validation split (`hair-osa-v1`). `data.yaml` maps permanent numeric labels to English names and appends temporary class 89, `Needs Review`; class names are not written into YOLO rows.
 

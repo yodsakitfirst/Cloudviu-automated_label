@@ -6,6 +6,7 @@ import argparse
 import csv
 import hashlib
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -293,15 +294,61 @@ def match_product_references(
     return matched
 
 
-def ascii_reference_name(sku: HairSku, source: Path) -> str:
-    """Return the deterministic English-safe reference filename."""
+def ascii_reference_name(sku: HairSku, source: Path, english_name: str) -> str:
+    """Return a deterministic, human-readable English reference filename."""
     suffix = Path(source).suffix.casefold()
     if suffix not in _PRODUCT_EXTENSIONS:
         raise ValueError(f"Unsupported product reference extension: {source}")
-    filename = f"class_{sku.class_id:03d}_{sku.barcode}{suffix}"
+    slug = re.sub(r"[^a-z0-9]+", "-", english_name.casefold()).strip("-")
+    if not slug:
+        raise ValueError(f"English reference name has no filename-safe text: {english_name!r}")
+    filename = f"class_{sku.class_id:03d}_{sku.barcode}_{slug}{suffix}"
     if not filename.isascii():
         raise ValueError(f"Prepared reference name is not ASCII: {filename}")
     return filename
+
+
+def _recover_zip_member_name(member: zipfile.ZipInfo) -> str:
+    """Recover UTF-8 names written by macOS tools without ZIP's UTF-8 flag."""
+    name = member.filename
+    if not member.flag_bits & 0x800:
+        try:
+            name = name.encode("cp437").decode("utf-8")
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            pass
+    return unicodedata.normalize("NFC", name)
+
+
+def _extract_product_archive(source: Path, destination: Path) -> Path:
+    """Safely materialize a flat product-image ZIP with recovered names."""
+    destination.mkdir()
+    names: set[str] = set()
+    try:
+        with zipfile.ZipFile(source) as archive:
+            for member in archive.infolist():
+                name = _recover_zip_member_name(member)
+                if (
+                    member.is_dir()
+                    or "/" in name
+                    or "\\" in name
+                    or name in {"", ".", ".."}
+                ):
+                    raise ValueError("Product reference ZIP must contain flat image files")
+                suffix = Path(name).suffix.casefold()
+                if suffix not in _PRODUCT_EXTENSIONS:
+                    continue
+                key = unicodedata.normalize("NFC", name).casefold()
+                if key in names:
+                    raise ValueError(f"Duplicate product reference ZIP member: {name}")
+                names.add(key)
+                target = destination / name
+                with archive.open(member) as input_handle, target.open(
+                    "wb"
+                ) as output_handle:
+                    shutil.copyfileobj(input_handle, output_handle)
+    except (OSError, zipfile.BadZipFile) as exc:
+        raise ValueError(f"Cannot read product reference ZIP {source}: {exc}") from exc
+    return destination
 
 
 def _load_cv2():
@@ -430,7 +477,10 @@ def _write_registry_files(
     records = [
         {
             "class_id": sku.class_id,
-            "image": f"references/{ascii_reference_name(sku, matched_references[sku.class_id])}",
+            "image": (
+                "references/"
+                f"{ascii_reference_name(sku, matched_references[sku.class_id], translations[sku.barcode])}"
+            ),
         }
         for sku in skus
     ]
@@ -528,17 +578,30 @@ def build_runtime_package(
     skus = load_sheet2_skus(inputs.workbook, inputs.expected_skus)
     overrides = load_reference_overrides(inputs.overrides)
     translations = load_sku_translations(inputs.translations, skus)
-    references = match_product_references(skus, inputs.product_images, overrides)
-    for source in references.values():
-        _validate_decodable_image(source, "Product reference")
     shelves = discover_shelf_images(inputs.shelf_images, inputs.expected_shelves)
-    _safe_destination(archive_path, [*required_files, *references.values(), *shelves])
 
     archive_path.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(
         prefix=".hair-colab-package-", dir=archive_path.parent
     ) as temporary_directory:
-        package_root = Path(temporary_directory) / "hair_colab"
+        temporary_root = Path(temporary_directory)
+        product_source = _safe_input_path(inputs.product_images)
+        if product_source.is_file():
+            if product_source.suffix.casefold() != ".zip":
+                raise ValueError(
+                    f"Product images must be a directory or ZIP archive: {product_source}"
+                )
+            product_root = _extract_product_archive(
+                product_source, temporary_root / "product_images"
+            )
+        else:
+            product_root = product_source
+        references = match_product_references(skus, product_root, overrides)
+        for source in references.values():
+            _validate_decodable_image(source, "Product reference")
+        _safe_destination(archive_path, [*required_files, *references.values(), *shelves])
+
+        package_root = temporary_root / "hair_colab"
         package_root.mkdir()
         for source, relative_destination in required_files.items():
             _copy_verified(source, package_root / relative_destination)
@@ -547,13 +610,15 @@ def build_runtime_package(
             source = references[sku.class_id]
             _copy_verified(
                 source,
-                package_root / "references" / ascii_reference_name(sku, source),
+                package_root
+                / "references"
+                / ascii_reference_name(sku, source, translations[sku.barcode]),
             )
         for source in shelves:
             _copy_verified(source, package_root / "shelf_images" / source.name)
         (package_root / "output").mkdir()
         _verify_ascii_tree(package_root)
-        temporary_archive = Path(temporary_directory) / "hair_colab_runtime.zip"
+        temporary_archive = temporary_root / "hair_colab_runtime.zip"
         _zip_tree(package_root, temporary_archive)
         os.replace(temporary_archive, archive_path)
 
@@ -573,7 +638,11 @@ def _positive_argument(value: str) -> int:
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--workbook", required=True)
-    parser.add_argument("--product-images", required=True)
+    parser.add_argument(
+        "--product-images",
+        required=True,
+        help="Flat product-image directory or ZIP archive",
+    )
     parser.add_argument("--shelf-images", required=True)
     parser.add_argument("--repo-root", default=str(Path(__file__).resolve().parent))
     parser.add_argument("--overrides", default="colab/reference_name_overrides.yaml")

@@ -24,6 +24,19 @@ def _positive_integer(value: Any, label: str) -> int:
     return value
 
 
+def _positive_number(value: Any, label: str) -> float:
+    parsed = _finite_number(value, label)
+    if parsed <= 0.0:
+        raise ValueError(f"{label} must be greater than 0")
+    return parsed
+
+
+def _boolean(value: Any, label: str) -> bool:
+    if type(value) is not bool:
+        raise ValueError(f"{label} must be true or false")
+    return value
+
+
 def _finite_number(value: Any, label: str) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValueError(f"{label} must be a finite number")
@@ -54,6 +67,21 @@ def _non_empty_string(value: Any, label: str) -> str:
 
 
 @dataclass(frozen=True)
+class RecallRetryConfig:
+    enabled: bool
+    min_candidates_per_megapixel: float
+    tile_size: int
+    overlap: float
+    conf: float
+    iou: float
+    min_side: int
+    max_area_ratio: float
+    min_aspect_ratio: float
+    max_aspect_ratio: float
+    nms_iou: float
+
+
+@dataclass(frozen=True)
 class LocalizationConfig:
     tile_size: int
     overlap: float
@@ -65,6 +93,7 @@ class LocalizationConfig:
     min_aspect_ratio: float
     max_aspect_ratio: float
     nms_iou: float
+    recall_retry: RecallRetryConfig | None = None
 
 
 @dataclass(frozen=True)
@@ -146,6 +175,80 @@ class BoxFirstConfig:
                 "localization.max_aspect_ratio must be at least localization.min_aspect_ratio"
             )
 
+        recall_retry = None
+        retry_value = localization_data.get("recall_retry")
+        if retry_value is not None:
+            if not isinstance(retry_value, Mapping):
+                raise ValueError("localization.recall_retry must be a mapping")
+            retry_prefix = "localization.recall_retry"
+            retry_overlap = _finite_number(
+                _required(retry_value, retry_prefix, "overlap"),
+                f"{retry_prefix}.overlap",
+            )
+            if not 0.0 <= retry_overlap < 1.0:
+                raise ValueError(
+                    f"{retry_prefix}.overlap must be at least 0 and less than 1"
+                )
+            retry_max_area = _finite_number(
+                _required(retry_value, retry_prefix, "max_area_ratio"),
+                f"{retry_prefix}.max_area_ratio",
+            )
+            if not 0.0 < retry_max_area <= 1.0:
+                raise ValueError(
+                    f"{retry_prefix}.max_area_ratio must be greater than 0 and at most 1"
+                )
+            retry_min_aspect = _positive_number(
+                _required(retry_value, retry_prefix, "min_aspect_ratio"),
+                f"{retry_prefix}.min_aspect_ratio",
+            )
+            retry_max_aspect = _positive_number(
+                _required(retry_value, retry_prefix, "max_aspect_ratio"),
+                f"{retry_prefix}.max_aspect_ratio",
+            )
+            if retry_max_aspect < retry_min_aspect:
+                raise ValueError(
+                    f"{retry_prefix}.max_aspect_ratio must be at least "
+                    f"{retry_prefix}.min_aspect_ratio"
+                )
+            recall_retry = RecallRetryConfig(
+                enabled=_boolean(
+                    _required(retry_value, retry_prefix, "enabled"),
+                    f"{retry_prefix}.enabled",
+                ),
+                min_candidates_per_megapixel=_positive_number(
+                    _required(
+                        retry_value,
+                        retry_prefix,
+                        "min_candidates_per_megapixel",
+                    ),
+                    f"{retry_prefix}.min_candidates_per_megapixel",
+                ),
+                tile_size=_positive_integer(
+                    _required(retry_value, retry_prefix, "tile_size"),
+                    f"{retry_prefix}.tile_size",
+                ),
+                overlap=retry_overlap,
+                conf=_closed_unit_interval(
+                    _required(retry_value, retry_prefix, "conf"),
+                    f"{retry_prefix}.conf",
+                ),
+                iou=_closed_unit_interval(
+                    _required(retry_value, retry_prefix, "iou"),
+                    f"{retry_prefix}.iou",
+                ),
+                min_side=_positive_integer(
+                    _required(retry_value, retry_prefix, "min_side"),
+                    f"{retry_prefix}.min_side",
+                ),
+                max_area_ratio=retry_max_area,
+                min_aspect_ratio=retry_min_aspect,
+                max_aspect_ratio=retry_max_aspect,
+                nms_iou=_closed_unit_interval(
+                    _required(retry_value, retry_prefix, "nms_iou"),
+                    f"{retry_prefix}.nms_iou",
+                ),
+            )
+
         localization = LocalizationConfig(
             tile_size=_positive_integer(
                 _required(localization_data, "localization", "tile_size"),
@@ -172,6 +275,7 @@ class BoxFirstConfig:
                 _required(localization_data, "localization", "nms_iou"),
                 "localization.nms_iou",
             ),
+            recall_retry=recall_retry,
         )
 
         visual_weight = _closed_unit_interval(

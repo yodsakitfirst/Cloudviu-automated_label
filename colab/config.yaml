@@ -16,18 +16,38 @@ localization:
   tile_size: 1024
   overlap: 0.20
   prompts:
+    - retail personal care product
+    - hair care product
     - shampoo bottle
     - conditioner bottle
+    - cosmetic bottle
+    - pump bottle
+    - aerosol can
+    - squeeze tube
     - hair treatment pouch
+    - product sachet
+    - cosmetic jar
     - boxed hair product
     - hair care multipack
-  conf: 0.10
+  conf: 0.05
   iou: 0.50
   min_side: 12
   max_area_ratio: 0.10
   min_aspect_ratio: 0.15
   max_aspect_ratio: 4.0
   nms_iou: 0.50
+  recall_retry:
+    enabled: true
+    min_candidates_per_megapixel: 10.0
+    tile_size: 640
+    overlap: 0.30
+    conf: 0.02
+    iou: 0.60
+    min_side: 6
+    max_area_ratio: 0.20
+    min_aspect_ratio: 0.08
+    max_aspect_ratio: 8.0
+    nms_iou: 0.70
 
 matching:
   model: ViT-B-32

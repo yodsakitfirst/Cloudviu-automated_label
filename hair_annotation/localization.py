@@ -8,7 +8,7 @@ from typing import Any
 
 import numpy as np
 
-from .config import LocalizationConfig
+from .config import LocalizationConfig, RecallRetryConfig
 from .types import Candidate, Tile
 
 
@@ -294,7 +294,9 @@ def _infer_tile(
     model: Any,
     image_bgr: np.ndarray,
     tile: Tile,
-    config: LocalizationConfig,
+    prompts: Sequence[str],
+    conf: float,
+    iou: float,
     imgsz: int,
     device: int | str,
 ) -> tuple[list[Candidate], int, int]:
@@ -306,12 +308,12 @@ def _infer_tile(
         results = model.predict(
             source=tile_image,
             imgsz=imgsz,
-            conf=config.conf,
-            iou=config.iou,
+            conf=conf,
+            iou=iou,
             device=device,
             verbose=False,
         )
-        return _parse_tile_result(results, tile, config.prompts)
+        return _parse_tile_result(results, tile, prompts)
     except Exception as exc:
         raise RuntimeError(
             f"YOLOE text localization failed for tile {tile.index}: {exc}"
@@ -339,14 +341,14 @@ def _diagnostics(
     return diagnostics
 
 
-def localize_image(
+def _localize_pass(
     model: Any,
     image_bgr: np.ndarray,
-    config: LocalizationConfig,
+    config: LocalizationConfig | RecallRetryConfig,
+    prompts: Sequence[str],
     imgsz: int,
     device: int | str,
 ) -> tuple[list[Candidate], dict[str, int]]:
-    """Run text-prompted YOLOE inference over tiled shelf imagery."""
     image_height, image_width = image_bgr.shape[:2]
     tiles = generate_tiles(image_width, image_height, config.tile_size, config.overlap)
     raw_candidates: list[Candidate] = []
@@ -354,7 +356,14 @@ def localize_image(
     fallback_count = 0
     for tile in tiles:
         tile_candidates, tile_masks, tile_fallbacks = _infer_tile(
-            model, image_bgr, tile, config, imgsz, device
+            model,
+            image_bgr,
+            tile,
+            prompts,
+            config.conf,
+            config.iou,
+            imgsz,
+            device,
         )
         raw_candidates.extend(tile_candidates)
         mask_count += tile_masks
@@ -363,15 +372,90 @@ def localize_image(
     filtered, rejected = filter_candidates(
         raw_candidates, image_width, image_height, config
     )
-    kept, duplicate_count = class_agnostic_nms(filtered, config.nms_iou)
-    return kept, _diagnostics(
+    return filtered, _diagnostics(
         len(tiles),
         len(raw_candidates),
         mask_count,
         fallback_count,
-        duplicate_count,
+        0,
         rejected,
     )
+
+
+def localize_image(
+    model: Any,
+    image_bgr: np.ndarray,
+    config: LocalizationConfig,
+    imgsz: int,
+    device: int | str,
+) -> tuple[list[Candidate], dict[str, Any]]:
+    """Run text-prompted YOLOE inference with an optional recall retry."""
+    primary, primary_diagnostics = _localize_pass(
+        model, image_bgr, config, config.prompts, imgsz, device
+    )
+    primary_kept, _ = class_agnostic_nms(primary, config.nms_iou)
+    retry = config.recall_retry
+    if retry is None:
+        kept, duplicate_count = class_agnostic_nms(primary, config.nms_iou)
+        primary_diagnostics["duplicates_removed"] = duplicate_count
+        return kept, primary_diagnostics
+
+    image_height, image_width = image_bgr.shape[:2]
+    megapixels = image_width * image_height / 1_000_000.0
+    required_candidates = max(
+        1, math.ceil(megapixels * retry.min_candidates_per_megapixel)
+    )
+    retry_triggered = retry.enabled and len(primary_kept) < required_candidates
+    retry_candidates: list[Candidate] = []
+    retry_diagnostics = _diagnostics(0, 0, 0, 0, 0, {})
+    if retry_triggered:
+        retry_candidates, retry_diagnostics = _localize_pass(
+            model, image_bgr, retry, config.prompts, imgsz, device
+        )
+
+    merged = [*primary, *retry_candidates]
+    nms_iou = retry.nms_iou if retry_triggered else config.nms_iou
+    kept, duplicate_count = class_agnostic_nms(merged, nms_iou)
+    retry_kept, _ = class_agnostic_nms(retry_candidates, retry.nms_iou)
+    diagnostics: dict[str, Any] = {
+        "tiles": primary_diagnostics["tiles"] + retry_diagnostics["tiles"],
+        "raw_candidates": (
+            primary_diagnostics["raw_candidates"]
+            + retry_diagnostics["raw_candidates"]
+        ),
+        "mask_boxes": (
+            primary_diagnostics["mask_boxes"] + retry_diagnostics["mask_boxes"]
+        ),
+        "fallback_boxes": (
+            primary_diagnostics["fallback_boxes"]
+            + retry_diagnostics["fallback_boxes"]
+        ),
+        "duplicates_removed": duplicate_count,
+    }
+    diagnostics.update(
+        {
+            reason: primary_diagnostics[reason] + retry_diagnostics[reason]
+            for reason in _GEOMETRY_REJECTION_KEYS
+        }
+    )
+    diagnostics.update(
+        {
+            "recall_retry_triggered": retry_triggered,
+            "recall_retry_reason": (
+                f"{len(primary_kept)} primary candidates below "
+                f"{required_candidates} required"
+                if retry_triggered
+                else None
+            ),
+            "primary_raw_candidates": primary_diagnostics["raw_candidates"],
+            "primary_candidates": len(primary_kept),
+            "retry_tiles": retry_diagnostics["tiles"],
+            "retry_raw_candidates": retry_diagnostics["raw_candidates"],
+            "retry_candidates": len(retry_kept),
+            "merged_candidates_before_nms": len(merged),
+        }
+    )
+    return kept, diagnostics
 
 
 def _filter_reference_candidates(
@@ -422,7 +506,14 @@ def localize_reference_image(
     image_height, image_width = image_bgr.shape[:2]
     tile = Tile(index=0, x=0, y=0, width=image_width, height=image_height)
     raw_candidates, mask_count, fallback_count = _infer_tile(
-        model, image_bgr, tile, config, imgsz, device
+        model,
+        image_bgr,
+        tile,
+        config.prompts,
+        config.conf,
+        config.iou,
+        imgsz,
+        device,
     )
     filtered, rejected = _filter_reference_candidates(
         raw_candidates, image_width, image_height

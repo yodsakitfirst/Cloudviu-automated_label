@@ -51,6 +51,67 @@ def test_box_first_defaults_are_parsed_and_immutable():
         config.localization.tile_size = 640
 
 
+def test_recall_retry_config_is_parsed():
+    data = valid_sections()
+    data["localization"]["recall_retry"] = {
+        "enabled": True,
+        "min_candidates_per_megapixel": 10.0,
+        "tile_size": 640,
+        "overlap": 0.30,
+        "conf": 0.02,
+        "iou": 0.60,
+        "min_side": 6,
+        "max_area_ratio": 0.20,
+        "min_aspect_ratio": 0.08,
+        "max_aspect_ratio": 8.0,
+        "nms_iou": 0.70,
+    }
+
+    config = BoxFirstConfig.from_mapping(data)
+
+    assert config.localization.recall_retry is not None
+    assert config.localization.recall_retry.enabled is True
+    assert config.localization.recall_retry.tile_size == 640
+    assert config.localization.recall_retry.conf == 0.02
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("enabled", "yes"),
+        ("min_candidates_per_megapixel", 0),
+        ("tile_size", 0),
+        ("overlap", 1.0),
+        ("conf", -0.01),
+        ("min_side", 0),
+        ("max_area_ratio", 1.1),
+        ("min_aspect_ratio", 0),
+        ("max_aspect_ratio", 0.01),
+        ("nms_iou", 1.1),
+    ],
+)
+def test_invalid_recall_retry_config_is_rejected(key, value):
+    data = valid_sections()
+    retry = {
+        "enabled": True,
+        "min_candidates_per_megapixel": 10.0,
+        "tile_size": 640,
+        "overlap": 0.30,
+        "conf": 0.02,
+        "iou": 0.60,
+        "min_side": 6,
+        "max_area_ratio": 0.20,
+        "min_aspect_ratio": 0.08,
+        "max_aspect_ratio": 8.0,
+        "nms_iou": 0.70,
+    }
+    retry[key] = value
+    data["localization"]["recall_retry"] = retry
+
+    with pytest.raises(ValueError, match=f"localization.recall_retry.{key}"):
+        BoxFirstConfig.from_mapping(data)
+
+
 @pytest.mark.parametrize(
     ("section", "key", "value", "message"),
     [

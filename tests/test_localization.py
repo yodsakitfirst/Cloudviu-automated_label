@@ -1,10 +1,11 @@
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest import mock
 
 import numpy as np
 import pytest
 
-from hair_annotation.config import LocalizationConfig
+from hair_annotation.config import LocalizationConfig, RecallRetryConfig
 from hair_annotation.localization import (
     class_agnostic_nms,
     filter_candidates,
@@ -36,6 +37,24 @@ def localization_config():
         max_aspect_ratio=4.0,
         nms_iou=0.50,
     )
+
+
+def recall_retry_config(**overrides):
+    values = {
+        "enabled": True,
+        "min_candidates_per_megapixel": 10.0,
+        "tile_size": 640,
+        "overlap": 0.30,
+        "conf": 0.02,
+        "iou": 0.60,
+        "min_side": 6,
+        "max_area_ratio": 0.20,
+        "min_aspect_ratio": 0.08,
+        "max_aspect_ratio": 8.0,
+        "nms_iou": 0.70,
+    }
+    values.update(overrides)
+    return RecallRetryConfig(**values)
 
 
 def test_tiles_cover_right_and_bottom_edges_without_duplicates():
@@ -215,6 +234,134 @@ def test_localize_image_falls_back_to_box_when_masks_are_unavailable():
     ]
     assert diagnostics["mask_boxes"] == 0
     assert diagnostics["fallback_boxes"] == 1
+
+
+def test_zero_candidate_primary_pass_uses_recall_retry():
+    empty = SimpleNamespace(
+        boxes=SimpleNamespace(
+            xyxy=np.empty((0, 4)), conf=np.array([]), cls=np.array([])
+        ),
+        masks=None,
+    )
+    retry_detection = SimpleNamespace(
+        boxes=SimpleNamespace(
+            xyxy=np.array([[20.0, 30.0, 80.0, 230.0]]),
+            conf=np.array([0.03]),
+            cls=np.array([0.0]),
+        ),
+        masks=None,
+    )
+    model = mock.Mock()
+    model.predict.side_effect = lambda **kwargs: [
+        retry_detection if kwargs["conf"] == 0.02 else empty
+    ]
+    config = replace(
+        localization_config(), recall_retry=recall_retry_config()
+    )
+
+    candidates, diagnostics = localize_image(
+        model,
+        np.zeros((1200, 1200, 3), dtype=np.uint8),
+        config,
+        imgsz=1280,
+        device=0,
+    )
+
+    assert len(candidates) == 9
+    assert diagnostics["recall_retry_triggered"] is True
+    assert diagnostics["recall_retry_reason"] == "0 primary candidates below 15 required"
+    assert diagnostics["primary_raw_candidates"] == 0
+    assert diagnostics["primary_candidates"] == 0
+    assert diagnostics["retry_tiles"] == 9
+    assert diagnostics["retry_raw_candidates"] == 9
+    assert diagnostics["retry_candidates"] == 9
+    assert diagnostics["merged_candidates_before_nms"] == 9
+    assert {call.kwargs["conf"] for call in model.predict.call_args_list[:4]} == {0.10}
+    assert {call.kwargs["conf"] for call in model.predict.call_args_list[4:]} == {0.02}
+
+
+def test_sparse_primary_candidates_are_merged_with_retry_candidates():
+    primary_detection = SimpleNamespace(
+        boxes=SimpleNamespace(
+            xyxy=np.array([[10.0, 20.0, 70.0, 220.0]]),
+            conf=np.array([0.20]),
+            cls=np.array([0.0]),
+        ),
+        masks=None,
+    )
+    retry_detection = SimpleNamespace(
+        boxes=SimpleNamespace(
+            xyxy=np.array([[400.0, 20.0, 460.0, 220.0]]),
+            conf=np.array([0.03]),
+            cls=np.array([1.0]),
+        ),
+        masks=None,
+    )
+    model = mock.Mock()
+    model.predict.side_effect = lambda **kwargs: [
+        retry_detection if kwargs["conf"] == 0.02 else primary_detection
+    ]
+    config = replace(
+        localization_config(),
+        tile_size=2000,
+        recall_retry=recall_retry_config(
+            min_candidates_per_megapixel=3.0, tile_size=2000
+        ),
+    )
+
+    candidates, diagnostics = localize_image(
+        model,
+        np.zeros((1000, 1000, 3), dtype=np.uint8),
+        config,
+        imgsz=1280,
+        device=0,
+    )
+
+    assert [candidate.xyxy for candidate in candidates] == [
+        (10.0, 20.0, 70.0, 220.0),
+        (400.0, 20.0, 460.0, 220.0),
+    ]
+    assert diagnostics["recall_retry_triggered"] is True
+    assert diagnostics["primary_candidates"] == 1
+    assert diagnostics["retry_candidates"] == 1
+    assert diagnostics["merged_candidates_before_nms"] == 2
+
+
+def test_adequate_primary_candidates_skip_recall_retry():
+    boxes = SimpleNamespace(
+        xyxy=np.array(
+            [
+                [10.0, 10.0, 70.0, 210.0],
+                [100.0, 10.0, 160.0, 210.0],
+                [190.0, 10.0, 250.0, 210.0],
+            ]
+        ),
+        conf=np.array([0.30, 0.25, 0.20]),
+        cls=np.array([0.0, 0.0, 0.0]),
+    )
+    model = mock.Mock()
+    model.predict.return_value = [SimpleNamespace(boxes=boxes, masks=None)]
+    config = replace(
+        localization_config(),
+        tile_size=2000,
+        recall_retry=recall_retry_config(
+            min_candidates_per_megapixel=3.0, tile_size=2000
+        ),
+    )
+
+    candidates, diagnostics = localize_image(
+        model,
+        np.zeros((1000, 1000, 3), dtype=np.uint8),
+        config,
+        imgsz=1280,
+        device=0,
+    )
+
+    assert len(candidates) == 3
+    assert diagnostics["recall_retry_triggered"] is False
+    assert diagnostics["retry_tiles"] == 0
+    assert diagnostics["retry_raw_candidates"] == 0
+    assert model.predict.call_count == 1
 
 
 def test_localize_image_falls_back_when_mask_polygon_cannot_form_a_box():
